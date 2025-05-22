@@ -6,12 +6,15 @@ import mrcfile
 import numpy as np
 from torch import nn
 from math import ceil
-import matplotlib.pyplot as plt
 import torchvision.transforms as T
 from torch import FloatTensor as FT
 from torch.autograd import Variable as V
 from concurrent.futures import ThreadPoolExecutor
 from torch.utils.data import Dataset, DataLoader
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from matplotlib.colors import Normalize
+import matplotlib.cm as cm
 
 
 def get_all_files(directory):
@@ -64,7 +67,7 @@ def split_and_save_tensor(map_file, save_dir, minPercent=0, maxPercent=99.999, b
     return n_chunks
 
 
-class CompressedDataset(Dataset):
+class myDataset(Dataset):
     def __init__(self, file_list):
         self.file_list = file_list
     
@@ -92,7 +95,8 @@ def get_augs(boxsize):
     return train_augs, test_augs
 
 
- 
+
+
 
 
     

@@ -3,3 +3,5 @@
 **/raw_data
 *.tif
 *.git
+datasets
+raw_data

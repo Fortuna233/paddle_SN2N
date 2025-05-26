@@ -4,14 +4,11 @@ from utils import *
 
 
 # 数据预处理
-# raw_path = "data1/ryi/paddle_SN2N/raw_data"
-# save_path = "data1/ryi/paddle_SN2N/datasets"
-# paramsFolder = "data1/ryi/paddle_SN2N/params"
+# raw_path = "/data1/ryi/paddle_SN2N/raw_data"
+# save_path = "/data1/ryi/paddle_SN2N/datasets"
 raw_path = "/home/tyche/paddle_SN2N/raw_data"
 save_path = "/home/tyche/paddle_SN2N/datasets"
-paramsFolder = "/home/tyche/paddle_SN2N/params"
 
-_, current_epochs = get_all_files(paramsFolder)
 raw_map_list, n_maps = get_all_files(raw_path)
 print(raw_map_list)
 

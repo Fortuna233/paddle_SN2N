@@ -14,7 +14,7 @@ from typing import Dict, Optional
 import torchvision.transforms as T
 from torch.utils.data import Dataset, DataLoader
 from concurrent.futures import ProcessPoolExecutor, as_completed
-
+from sklearn.model_selection import train_test_split
 import time
 import argparse
 import torch.backends
@@ -310,45 +310,120 @@ def loss_channels(X, Y, loss_fun=nn.MSELoss()):
 def get_dataset(save_path, batch_size, DDP=False):
     chunkList, n_chunks = get_all_files(save_path)
     chunks_file = [os.path.join(save_path, f) for f in os.listdir(save_path) if f.endswith('.npz')]
-    trainSet = myDataset(chunks_file, is_train=True)
-    if DDP:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(trainSet)
-    train_iter = DataLoader(trainSet, batch_size=batch_size, num_workers=4,
-                              pin_memory=True)
-    return train_iter
+    trainData, valiData = train_test_split(chunks_file, test_size=0.25, random_state=42)
+    trainSet = myDataset(trainData, is_train=True)
+    valiSet = myDataset(valiData, is_train=False)
+    train_iter = DataLoader(trainSet, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True, prefetch_factor=2)
+    vali_iter = DataLoader(trainSet, batch_size=batch_size, shuffle=False, num_workers=4 * torch.cuda.device_count(), pin_memory=True, prefetch_factor=2)
+    return train_iter, vali_iter
 
 
-def train(model, train_dataloader, optimizer, scheduler, criterion, actual_epoch, scaler, args):
+def init_ddp(local_rank):
+    torch.cuda.set_device(local_rank)
+    os.environp['RANK'] = str(local_rank) 
+    dist.init_process_group(backend='nccl', init_method='env://')
 
-    model.train()
-    
-    tr_loss = 0
-    num_train_samples = 0
-    
-    for step, batch in enumerate(train_dataloader):
-        
-        batch = tuple(t.cuda(non_blocking=True) for t in batch)
-        b_input_ids, b_input_mask, b_labels = batch
-        with autocast(device_type='cuda'):
-	        output = model(b_input_ids, attention_mask=b_input_mask, labels=b_labels) # 运行到这一行会增加一下显存
-            loss = criterion(output.logits.view(-1,args['num_labels']), b_labels.type_as(output.logits).view(-1,args['num_labels']))
-        
-        reduced_loss = reduce_tensor(loss.data)  # 对并行进程计算的多个 loss 取平均
-        if dist.get_rank() == 0:  # 防止重复输出
-            print("\nOutput Loss: ", reduced_loss.item())
-        tr_loss += reduced_loss.item()
-        
-        # 并行状态下的更新，不同进程分别根据自己计算的 loss 更新数据
-        optimizer.zero_grad()
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)  #  运行到这一行会增加一下显存
-        # 下面四行，多个进程只执行一次
-        scheduler.step()
-        scaler.update()
-        num_train_samples += b_labels.size(0) #将批次中的样本数量添加到 num_train_samples 中。
-        torch.cuda.empty_cache()  # 释放GPU reserved memory显存
-    
-    epoch_train_loss = tr_loss / num_train_samples  # num_train_samples 代表每个进程承接的样本数量，由于上面已经有对loss取平均的操作，这里分母无需再乘以进程数
 
-    if dist.get_rank() == 0:
-        print("\nTrain loss after Epoch {} : {}".format(actual_epoch, epoch_train_loss))
+def reduce_tensor(tensor: torch.Tensor):
+    rt = tensor.clone()
+    dist.all_reduce(rt, op=dist.reduce_op.SUM)
+    rt /= dist.get_world_size()
+    return rt
+
+
+def get_ddp_generator(seed=42):
+    local_rank = dist.get_rank()
+    g = torch.Generator()
+    g.manual_seed(seed + local_rank)
+    return g
+
+
+def train(model, num_epochs=300, batch_size=24, accumulation_steps=4):
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"num_parameters: {total_params}")  
+    def init_weights(m):
+        if type(m) == nn.Linear or type(m) == nn.Conv3d:  
+            nn.init.xavier_uniform_(m.weight)
+    model.apply(init_weights)
+    paramsFolder = "./params"
+    _, current_epochs = get_all_files(paramsFolder)
+    if current_epochs != 0:
+        model.load_state_dict(torch.load(f'params/checkPoint_{current_epochs - 1}'))
+    devices = try_all_gpus()
+    model = model.to(device=devices[0])
+    # model = DataParallel(model, device_ids=[0, 1, 2])
+    model = torch.compile(model)
+    train_iter, vali_iter = get_dataset(save_path='./datasets', batch_size=batch_size)
+    trainer = torch.optim.AdamW(model.parameters(), lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-2, amsgrad=False)
+    scheduler = OneCycleLR(trainer, max_lr=0.01, total_steps=batch_size*len(train_iter), pct_start=0.3, anneal_strategy='cos', cycle_momentum=True, base_momentum=0.85, max_momentum=0.95,div_factor=25,final_div_factor=1e5)
+    scaler = GradScaler()
+
+    train_Loss = []
+    vali_Loss = []
+    kernel = torch.tensor([[[[1, 0], [0, 1]], [[0, 1], [1, 0]]], 
+                           [[[0, 1], [1, 0]], [[1, 0], [0, 1]]]]).float()
+    starttime = time.time()
+    for epoch in range(current_epochs, num_epochs):
+        # train_iter.sampler.set_epoch(epoch)
+        train_loss = 0
+        vali_loss = 0
+        loss_batch = 0
+        model.train()
+        for i, X in enumerate(train_iter):
+            X = resample(X, kernel=kernel)
+            batch_size, channels, *spatial_dims = X.shape
+            X = X.reshape(batch_size * channels, 1, *spatial_dims).to(devices[0])
+            with autocast(device_type='cuda'):
+                Y = model(X)
+                X = X.reshape(batch_size, channels, *spatial_dims)
+                Y = Y.reshape(batch_size, channels, *spatial_dims)
+                l = loss_channels(X, Y)
+                train_loss += l.item()
+                loss_batch += l.item() / accumulation_steps
+                del X, Y
+            scaler.scale(l).backward()
+            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            if (i + 1) % accumulation_steps == 0:
+                scaler.step(trainer)
+                scaler.update()
+                scheduler.step()
+                trainer.zero_grad(set_to_none=True)
+                Time = time.time() - starttime  
+                log_msg = f"[epoch: {epoch}] [processing: {i + 1}/{len(train_iter)}] [loss: {loss_batch}] [lr: {trainer.param_groups[0]['lr']}] [Time: {Time:.2f}s]"
+                print(log_msg)
+                loss_batch = 0
+                with open("output.log", "a") as file:
+                    file.write(log_msg + "\n")
+        epoch_loss = train_loss / len(train_iter)
+        train_Loss.append(epoch_loss)
+
+        with torch.no_grad():
+            for X in vali_iter:
+                X = resample(X, kernel=kernel)
+                batch_size, channels, *spatial_dims = X.shape
+                X = X.reshape(batch_size * channels, 1, *spatial_dims).to(devices[0])
+                Y = model(X)
+                X = X.reshape(batch_size, channels, *spatial_dims)
+                Y = Y.reshape(batch_size, channels, *spatial_dims)
+                l = loss_channels(X, Y)
+                vali_loss += l
+        vali_Loss.append(vali_loss / len(vali_iter))
+
+
+        log_msg = f"[epoch: {epoch}] [processing: {i + 1}/{len(train_iter)}] [train_loss: {loss_batch}] [vali_loss: {vali_Loss[-1]}] [lr: {trainer.param_groups[0]['lr']}] [Time: {Time:.2f}s]"
+        print(log_msg)
+        print(f"checkPoint_{epoch}")
+        print("=================================================================================================================")
+        with open("output.log", "a") as file:
+            file.write(log_msg + "\n")
+        # torch.save(model.module.state_dict(), f"params/checkPoint_{epoch}")
+        torch.save(model.state_dict(), f"params/checkPoint_{epoch}")
+    train_Loss = np.array(train_Loss)
+    np.savez_compressed('Loss.npz', train_Loss)
+    plt.plot(range(num_epochs), train_Loss)
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training Loss')
+    plt.savefig('training_loss.png')  # 保存图像
+    plt.show()
+

@@ -3,6 +3,7 @@ import torch
 import imageio
 import mrcfile
 import tifffile
+from pathlib import Path
 import numpy as np
 from torch import nn
 import torch.fft as fft
@@ -88,31 +89,30 @@ def try_all_gpus():
 #     return n_chunks
 
 
-def process_chunk(padded_map, map_file, save_dir, chunk_coords, box_size):
+def process_chunk(padded_map, map_file, save_dir, chunk_coords, box_size, map_index):
     """处理单个数据块并保存"""
     cur_x, cur_y, cur_z = chunk_coords
     next_chunk = padded_map[cur_x:cur_x + box_size, cur_y:cur_y + box_size, cur_z:cur_z + box_size].numpy()
-    filepath = os.path.join(save_dir, f'{map_file[-21:-4]}_{cur_x}_{cur_y}_{cur_z}.npz')
+    filepath = os.path.join(save_dir, f'{map_index}_{cur_x}_{cur_y}_{cur_z}.npz')
     np.savez_compressed(filepath, next_chunk)
     return filepath, next_chunk.shape
 
 
-def split_and_save_tensor(map_file, save_dir, minPercent=0, maxPercent=99.999, box_size=48, stride=12, file_type='.mrc', num_workers=None):
+def split_and_save_tensor(map_file, save_dir, map_index, minPercent=0, maxPercent=99.999, box_size=48, stride=12):
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
 
-    # 读取数据
-    if file_type == '.mrc':
+    map_path = Path(map_file)
+    if map_path.suffix == '.mrc':
         print("mapFile:", map_file)
         mrc = mrcfile.open(map_file, mode='r')
         map_data = np.asarray(mrc.data.copy(), dtype=np.float32)
         mrc.close()
-    elif file_type == '.tif':
+    elif map_path.suffix == '.tif':
         print("mapFile:", map_file)
         map_data = np.array(tifffile.imread(map_file))
     else:
-        raise ValueError(f"Unsupported file type: {file_type}")
-    
+        print(f"unsupported filetype: {map_file.suffix}, only mrcfile and tifffile supported.")
     # 归一化和填充
     min_val = np.percentile(map_data, minPercent)
     max_val = np.percentile(map_data, maxPercent)
@@ -145,11 +145,10 @@ def split_and_save_tensor(map_file, save_dir, minPercent=0, maxPercent=99.999, b
                 cur_x = start_point  # Reset X
     
     # 设置并行工作进程数
-    if num_workers is None:
-        num_workers = multiprocessing.cpu_count()
+    num_workers = multiprocessing.cpu_count()
     
     # 使用进程池并行处理
-    process_func = partial(process_chunk, padded_map, map_file, save_dir, box_size=box_size)
+    process_func = partial(process_chunk, padded_map, map_file, save_dir, box_size=box_size, map_index=map_index)
     
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
         futures = [executor.submit(process_func, coords) for coords in chunk_coords_list]
@@ -178,8 +177,8 @@ class myDataset(Dataset):
 
     def __getitem__(self, index):
         if self.is_train:
-            return train_augs(torch.from_numpy(np.load(self.file_list[index])['arr_0']))
-        return torch.from_numpy(np.load(self.file_list[index])['arr_0'])
+            return train_augs(torch.from_numpy(np.load(self.file_list[index])['arr_0'])), os.path.basename(self.file_list[index])
+        return torch.from_numpy(np.load(self.file_list[index])['arr_0']), os.path.basename(self.file_list[index])
 
 
 def fourier_interpolate(tensor, scale_factor=2):
@@ -192,9 +191,8 @@ def fourier_interpolate(tensor, scale_factor=2):
     new_d = d * scale_factor
     new_h = h * scale_factor
     new_w = w * scale_factor
-    new_w_rfft = new_w // 2 + 1  # rfft输出的最后一维大小
+    new_w_rfft = new_w // 2 + 1  
     
-    # 创建零张量用于填充
     tensor_fft_padded = torch.zeros(
         (batch_size, channels, new_d, new_h, new_w_rfft),
         dtype=tensor_fft.dtype,
@@ -202,7 +200,7 @@ def fourier_interpolate(tensor, scale_factor=2):
     )
     d_start = (new_d - d) // 2
     h_start = (new_h - h) // 2
-    w_start = 0  # rfft的低频部分从0开始
+    w_start = 0  
     
     tensor_fft_padded[
         :, :, 
@@ -318,26 +316,6 @@ def get_dataset(save_path, batch_size, DDP=False):
     return train_iter, vali_iter
 
 
-def init_ddp(local_rank):
-    torch.cuda.set_device(local_rank)
-    os.environp['RANK'] = str(local_rank) 
-    dist.init_process_group(backend='nccl', init_method='env://')
-
-
-def reduce_tensor(tensor: torch.Tensor):
-    rt = tensor.clone()
-    dist.all_reduce(rt, op=dist.reduce_op.SUM)
-    rt /= dist.get_world_size()
-    return rt
-
-
-def get_ddp_generator(seed=42):
-    local_rank = dist.get_rank()
-    g = torch.Generator()
-    g.manual_seed(seed + local_rank)
-    return g
-
-
 def train(model, num_epochs=300, batch_size=24, accumulation_steps=4):
     total_params = sum(p.numel() for p in model.parameters())
     print(f"num_parameters: {total_params}")  
@@ -369,7 +347,7 @@ def train(model, num_epochs=300, batch_size=24, accumulation_steps=4):
         vali_loss = 0
         loss_batch = 0
         model.train()
-        for i, X in enumerate(train_iter):
+        for i, (X, _) in enumerate(train_iter):
             X = resample(X, kernel=kernel)
             batch_size, channels, *spatial_dims = X.shape
             X = X.reshape(batch_size * channels, 1, *spatial_dims).to(devices[0])
@@ -398,7 +376,7 @@ def train(model, num_epochs=300, batch_size=24, accumulation_steps=4):
         train_Loss.append(epoch_loss)
 
         with torch.no_grad():
-            for X in vali_iter:
+            for (X, _) in vali_iter:
                 X = resample(X, kernel=kernel)
                 batch_size, channels, *spatial_dims = X.shape
                 X = X.reshape(batch_size * channels, 1, *spatial_dims).to(devices[0])
@@ -427,3 +405,51 @@ def train(model, num_epochs=300, batch_size=24, accumulation_steps=4):
     plt.savefig('training_loss.png')  # 保存图像
     plt.show()
 
+
+# input raw_map and output prediction file and a gif of to map
+def predict(mapFolder, model):
+    predicFolder = './predictions'
+    if not os.path.exists(predicFolder):
+        os.makedirs(predicFolder)
+    chunk_files = [os.path.join('./datasets', f) for f in os.listdir('./datasets') if f.endswith('.npz')]
+    
+    predictData = myDataset(chunk_files, is_train=True)
+    predSet = myDataset(predictData, is_train=False)
+    pred_iter = DataLoader(predSet, batch_size=48, shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
+    paramsFolder = "./params"
+    _, current_epochs = get_all_files(paramsFolder)
+    if current_epochs != 0:
+        model.load_state_dict(torch.load(f'params/checkPoint_{current_epochs - 1}'))
+    devices = try_all_gpus()
+    model = model.to(device=devices[0])
+    # model = DataParallel(model, device_ids=[0, 1, 2])
+    model = torch.compile(model)
+    with torch.no_grad():
+        for i, (X, chunk_names) in enumerate(pred_iter):
+            X = X.to(devices[0])
+            X = model(X)
+            for index, chunk_name in enumerate(chunk_names):
+                filepath = os.path.join('./predictions', chunk_name)
+                np.savez_compressed(filepath, X[index, :, :, :].numpy())
+                print(f"[{i}/{len(pred_iter)}] save {filepath}")
+        
+
+
+def init_ddp(local_rank):
+    torch.cuda.set_device(local_rank)
+    os.environp['RANK'] = str(local_rank) 
+    dist.init_process_group(backend='nccl', init_method='env://')
+
+
+def reduce_tensor(tensor: torch.Tensor):
+    rt = tensor.clone()
+    dist.all_reduce(rt, op=dist.reduce_op.SUM)
+    rt /= dist.get_world_size()
+    return rt
+
+
+def get_ddp_generator(seed=42):
+    local_rank = dist.get_rank()
+    g = torch.Generator()
+    g.manual_seed(seed + local_rank)
+    return g

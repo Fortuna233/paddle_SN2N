@@ -14,7 +14,6 @@ print(raw_map_list)
 
 
 n_chunks, i = 0, 0
-for mapfile in raw_map_list:
-    n_chunks += split_and_save_tensor(mapfile, save_path, file_type='.tif')
-    i += 1 
+for i, mapfile in enumerate(raw_map_list):
+    n_chunks += split_and_save_tensor(mapfile, save_path, map_index=i)
     print(f'processing: {i}/{n_maps}')

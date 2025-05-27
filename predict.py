@@ -1,6 +1,6 @@
 from utils import *
 
-save_path
+
 
 
 paramsFolder = "./params"

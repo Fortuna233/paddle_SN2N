@@ -15,6 +15,21 @@ import torchvision.transforms as T
 from torch.utils.data import Dataset, DataLoader
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
+import time
+import argparse
+import torch.backends
+import torch.utils
+from monai.networks.nets import UNet
+from torch.amp import GradScaler, autocast
+from torch.optim import AdamW
+from torch.nn import DataParallel
+import torch.distributed as dist
+from torch.optim.lr_scheduler import OneCycleLR
+import torch.multiprocessing as mp
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+
 
 
 
@@ -281,7 +296,7 @@ def loss(pred, target):
     return smooth_l1_loss(pred, target) + 1 - ssim(pred, target, data_range=1.0, size_average=True)
 
 
-def loss_channels(X, Y, loss_fun=loss):
+def loss_channels(X, Y, loss_fun=nn.MSELoss()):
     l = 0
     for i in range(X.shape[1]):
         for j in range(X.shape[1]):
@@ -290,3 +305,50 @@ def loss_channels(X, Y, loss_fun=loss):
                 l += loss_fun(X[:, j, :, :, :], Y[:, i, :, : ,:])
                 l += loss_fun(Y[:, i, :, :, :], Y[:, j, :, : ,:])
     return l
+
+
+def get_dataset(save_path, batch_size, DDP=False):
+    chunkList, n_chunks = get_all_files(save_path)
+    chunks_file = [os.path.join(save_path, f) for f in os.listdir(save_path) if f.endswith('.npz')]
+    trainSet = myDataset(chunks_file, is_train=True)
+    if DDP:
+        train_sampler = torch.utils.data.distributed.DistributedSampler(trainSet)
+    train_iter = DataLoader(trainSet, batch_size=batch_size, num_workers=4,
+                              pin_memory=True)
+    return train_iter
+
+
+def train(model, train_dataloader, optimizer, scheduler, criterion, actual_epoch, scaler, args):
+
+    model.train()
+    
+    tr_loss = 0
+    num_train_samples = 0
+    
+    for step, batch in enumerate(train_dataloader):
+        
+        batch = tuple(t.cuda(non_blocking=True) for t in batch)
+        b_input_ids, b_input_mask, b_labels = batch
+        with autocast(device_type='cuda'):
+	        output = model(b_input_ids, attention_mask=b_input_mask, labels=b_labels) # 运行到这一行会增加一下显存
+            loss = criterion(output.logits.view(-1,args['num_labels']), b_labels.type_as(output.logits).view(-1,args['num_labels']))
+        
+        reduced_loss = reduce_tensor(loss.data)  # 对并行进程计算的多个 loss 取平均
+        if dist.get_rank() == 0:  # 防止重复输出
+            print("\nOutput Loss: ", reduced_loss.item())
+        tr_loss += reduced_loss.item()
+        
+        # 并行状态下的更新，不同进程分别根据自己计算的 loss 更新数据
+        optimizer.zero_grad()
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)  #  运行到这一行会增加一下显存
+        # 下面四行，多个进程只执行一次
+        scheduler.step()
+        scaler.update()
+        num_train_samples += b_labels.size(0) #将批次中的样本数量添加到 num_train_samples 中。
+        torch.cuda.empty_cache()  # 释放GPU reserved memory显存
+    
+    epoch_train_loss = tr_loss / num_train_samples  # num_train_samples 代表每个进程承接的样本数量，由于上面已经有对loss取平均的操作，这里分母无需再乘以进程数
+
+    if dist.get_rank() == 0:
+        print("\nTrain loss after Epoch {} : {}".format(actual_epoch, epoch_train_loss))

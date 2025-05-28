@@ -23,6 +23,6 @@ model = UNet(spatial_dims=3, in_channels=1, out_channels=1, channels=[4, 8, 16, 
              num_res_units=2)
 
 
-train(model=model)
+train(model=model, num_epochs=20, batch_size=24, accumulation_steps=5)
 
 

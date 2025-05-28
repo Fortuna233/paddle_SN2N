@@ -6,6 +6,7 @@ import tifffile
 from pathlib import Path
 import numpy as np
 from torch import nn
+from torch.nn import functional as F
 import torch.fft as fft
 import multiprocessing
 from functools import partial
@@ -128,8 +129,8 @@ class myDataset(Dataset):
     def __init__(self, file_list, is_train):
         self.file_list = file_list
         self.is_train = is_train
-        chunk_positions = [os.path.splitext(f)[0].split("_") for f in chunk_names]
-        chunk_positions = np.array(chunk_positions, dtype=int)[:, 1:]
+        self.train_augs = T.Compose([T.RandomHorizontalFlip(p=0.5), T.RandomVerticalFlip(p=0.5)])
+ 
 
     def __len__(self):
         return len(self.file_list)
@@ -137,7 +138,7 @@ class myDataset(Dataset):
 
     def __getitem__(self, index):
         if self.is_train:
-            return train_augs(torch.from_numpy(np.load(self.file_list[index])['arr_0'])), np.array(os.path.splitext(os.path.basename(self.file_list[index]))[0].split("_"), dtype=int)[1:]
+            return self.train_augs(torch.from_numpy(np.load(self.file_list[index])['arr_0'])), np.array(os.path.splitext(os.path.basename(self.file_list[index]))[0].split("_"), dtype=int)[1:]
         return torch.from_numpy(np.load(self.file_list[index])['arr_0']), np.array(os.path.splitext(os.path.basename(self.file_list[index]))[0].split("_"), dtype=int)[1:]
 
 
@@ -182,12 +183,7 @@ def resample(batch_chunks, kernel):
     conv_layer = nn.Conv3d(in_channels=1, out_channels=kernel.shape[0], kernel_size=2, stride=2, padding=0, bias=False)
     conv_layer.weight.data = kernel
     batch_chunks = conv_layer(batch_chunks)
-    return fourier_interpolate(batch_chunks)
-
-
-def train_augs(tensor):
-    augs = T.Compose([T.RandomHorizontalFlip(p=0.5), T.RandomVerticalFlip(p=0.5)])
-    return augs(tensor) 
+    return F.interpolate(batch_chunks, scale_factor=2, mode='trilinear')
 
 
 def combine_tensors_to_gif(
@@ -357,10 +353,13 @@ def train(model, num_epochs=300, batch_size=24, accumulation_steps=4):
         # torch.save(model.module.state_dict(), f"params/checkPoint_{epoch}")
         torch.save(model.state_dict(), f"params/checkPoint_{epoch}")
     train_Loss = np.array(train_Loss)
-    np.savez_compressed('Loss.npz', train_Loss)
-    plt.plot(range(num_epochs), train_Loss)
+    vali_Loss = np.array(vali_Loss)
+    np.savez_compressed('Loss.npz', train_Loss, vali_Loss)
+    plt.plot(range(num_epochs), train_Loss, label='train loss')
+    plt.plot(range(num_epochs), vali_Loss, label='vali loss')
     plt.xlabel('Epoch')
-    plt.ylabel('Loss')
+    plt.ylabel('log(Loss)')
+    plt.yscale('log')
     plt.title('Training Loss')
     plt.savefig('training_loss.png')  # 保存图像
     plt.show()

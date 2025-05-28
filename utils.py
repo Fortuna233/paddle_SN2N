@@ -48,47 +48,6 @@ def try_all_gpus():
     return devices if devices else [torch.device('cpu')]
 
 
-# def split_and_save_tensor(map_file, save_dir, minPercent=0, maxPercent=99.999, box_size=48, stride=12, file_type='.mrc'):
-#     if not os.path.exists(save_dir):
-#         os.makedirs(save_dir)
-
-#     if file_type == '.mrc':
-#         print("mapFile:", map_file)
-#         mrc = mrcfile.open(map_file, mode='r')
-#         map = np.asarray(mrc.data.copy(), dtype=np.float32)
-#         mrc.close()
-#     if file_type == '.tif':
-#         print("mapFile:", map_file)
-#         map = np.array(tifffile.imread(map_file))
-    
-#     min = np.percentile(map, minPercent)
-#     max = np.percentile(map, maxPercent)
-#     map = map.clip(min=min, max=max) / max
-#     map_shape = map.shape
-#     padded_map = np.full((map_shape[0] + 2 * box_size, map_shape[1] + 2 * box_size, map_shape[2] + 2 * box_size), 0.0, dtype=np.float32)
-#     padded_map[box_size : box_size + map_shape[0], box_size : box_size + map_shape[1], box_size : box_size + map_shape[2]] = map
-#     padded_map = torch.from_numpy(padded_map)
-#     n_chunks = 0
-#     start_point = box_size - stride
-#     cur_x, cur_y, cur_z = start_point, start_point, start_point
-#     while (cur_z + stride < map_shape[2] + box_size):
-#         next_chunk = padded_map[cur_x:cur_x + box_size, cur_y:cur_y + box_size, cur_z:cur_z + box_size]
-#         filepath = os.path.join(save_dir, f'{map_file[-21:-4]}_{cur_x}_{cur_y}_{cur_z}.npz')
-#         print(f"filename: {filepath}, chunk_shape: {next_chunk.shape}")  
-#         cur_x += stride
-#         if (cur_x + stride >= map_shape[0] + box_size):
-#             cur_y += stride
-#             cur_x = start_point # Reset X
-#             if (cur_y + stride  >= map_shape[1] + box_size):
-#                 cur_z += stride
-#                 cur_y = start_point # Reset Y
-#                 cur_x = start_point # Reset X
-#         np.savez_compressed(filepath, next_chunk)
-#         n_chunks += 1
-#     print(n_chunks)
-#     return n_chunks
-
-
 def process_chunk(padded_map, map_file, save_dir, chunk_coords, box_size, map_index):
     """处理单个数据块并保存"""
     cur_x, cur_y, cur_z = chunk_coords
@@ -169,7 +128,8 @@ class myDataset(Dataset):
     def __init__(self, file_list, is_train):
         self.file_list = file_list
         self.is_train = is_train
-
+        chunk_positions = [os.path.splitext(f)[0].split("_") for f in chunk_names]
+        chunk_positions = np.array(chunk_positions, dtype=int)[:, 1:]
 
     def __len__(self):
         return len(self.file_list)
@@ -177,8 +137,8 @@ class myDataset(Dataset):
 
     def __getitem__(self, index):
         if self.is_train:
-            return train_augs(torch.from_numpy(np.load(self.file_list[index])['arr_0'])), os.path.basename(self.file_list[index])
-        return torch.from_numpy(np.load(self.file_list[index])['arr_0']), os.path.basename(self.file_list[index])
+            return train_augs(torch.from_numpy(np.load(self.file_list[index])['arr_0'])), np.array(os.path.splitext(os.path.basename(self.file_list[index]))[0].split("_"), dtype=int)[1:]
+        return torch.from_numpy(np.load(self.file_list[index])['arr_0']), np.array(os.path.splitext(os.path.basename(self.file_list[index]))[0].split("_"), dtype=int)[1:]
 
 
 def fourier_interpolate(tensor, scale_factor=2):
@@ -407,15 +367,15 @@ def train(model, num_epochs=300, batch_size=24, accumulation_steps=4):
 
 
 # input raw_map and output prediction file and a gif of to map
-def predict(mapFolder, model):
-    predicFolder = './predictions'
-    if not os.path.exists(predicFolder):
-        os.makedirs(predicFolder)
-    chunk_files = [os.path.join('./datasets', f) for f in os.listdir('./datasets') if f.endswith('.npz')]
+def predict(map_shape, map_index, model, box_size=48):
     
+    predicFolder = './predictions'
+    chunk_files = [os.path.join(predicFolder, f) for f in os.listdir(predicFolder) if f.endswith('.npz') and int(os.path.splitext(f)[0].split("_")[0]) == map_index]
+
     predictData = myDataset(chunk_files, is_train=True)
     predSet = myDataset(predictData, is_train=False)
     pred_iter = DataLoader(predSet, batch_size=48, shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
+
     paramsFolder = "./params"
     _, current_epochs = get_all_files(paramsFolder)
     if current_epochs != 0:
@@ -424,15 +384,37 @@ def predict(mapFolder, model):
     model = model.to(device=devices[0])
     # model = DataParallel(model, device_ids=[0, 1, 2])
     model = torch.compile(model)
+
+    map = np.zeros(tuple(dim + 2 * box_size for dim in map_shape), dtype=np.float32)
+    denominator = np.zeros_like(map)
+
     with torch.no_grad():
-        for i, (X, chunk_names) in enumerate(pred_iter):
+        for i, (X, chunk_positions) in enumerate(pred_iter):
             X = X.to(devices[0])
             X = model(X)
-            for index, chunk_name in enumerate(chunk_names):
-                filepath = os.path.join('./predictions', chunk_name)
+
+            for chunk, chunk_position in zip(X.numpy(), chunk_positions):
+                map[chunk_position[0]:chunk_position + box_size,
+                    chunk_position[1]:chunk_position + box_size,
+                    chunk_position[2]:chunk_position + box_size] += chunk
+                denominator[chunk_position[0]:chunk_position + box_size,
+                    chunk_position[1]:chunk_position + box_size,
+                    chunk_position[2]:chunk_position + box_size] += 1
+                
+            for index, chunk_position in enumerate(chunk_positions):
+                filepath = os.path.join('./predictions', f"{map_index}_{chunk_position[0]}_{chunk_position[1]}_{chunk_position[2]}")
                 np.savez_compressed(filepath, X[index, :, :, :].numpy())
                 print(f"[{i}/{len(pred_iter)}] save {filepath}")
-        
+
+    return (map / denominator.clip(min=1))[box_size : map_shape[0] + box_size, box_size : map_shape[1] + box_size, box_size : map_shape[2] + box_size]
+
+
+def get_map_from_predictions():
+    # chunk_files = [os.path.join('./predictions', f) for f in os.listdir('./predictions') if f.endswith('.npz')]
+    chunk_files = [os.path.join('./datasets', f) for f in os.listdir('./datasets') if f.endswith('.npz')]
+    chunk_positions = [os.path.splitext(os.path.basename(f))[0].split("_") for f in chunk_files]
+    print(chunk_positions)
+    
 
 
 def init_ddp(local_rank):

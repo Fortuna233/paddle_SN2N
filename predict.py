@@ -1,12 +1,51 @@
+import os
+import time
+import torch
+import tifffile
+import torch.backends
+import torch.utils
+import numpy as np
 from utils import *
+from monai.networks.nets import UNet
+from scunet import SCUNet
 
+torch.backends.cudnn.benchmark = True
+torch._dynamo.config.suppress_errors = True
+# save_path = "/home/tyche/paddle_SN2N/datasets"
+save_path = "./raw_data"
+predict_path = "./predictions"
+map_files, _ = get_all_files(save_path)
+# model = SCUNet(in_nc=1, config=[2, 2, 2, 2, 2, 2, 2],
+#                dim=32, drop_path_rate=0.1, input_resolution=48, head_dim=16, window_size=3)
+model = UNet(spatial_dims=3, 
+             in_channels=1, 
+             out_channels=1, 
+             channels=[4, 8, 16, 32],
+             strides=(2, 2, 2),
+             num_res_units=2)
 
+for map_index, map_file in enumerate(map_files):
+    # _ = split_and_save_tensor(map_file=map_file,
+    #                           save_dir=predict_path,
+    #                           map_index=map_index)
+    print(map_file)
+    
+    raw_map = np.asarray(tifffile.imread(map_file))
+    raw_map = raw_map.clip(min=0.0, max=np.percentile(raw_map[raw_map > 0], 99.999)) / np.percentile(raw_map[raw_map > 0], 99.999)
 
+    denoised_map = predict(map_shape=raw_map.shape, map_index=map_index, model=model)
+    tifffile.imwrite(f"{os.path.splitext(os.path.basename(map_file))[0]}_denoised.tif", denoised_map, imagej=True)  # 使用ImageJ格式支持多维
+    
+    # for i in range(denoised_map.shape[0]):
+    #     denoised_map[i] = denoised_map[i].clip(min=0, max=np.percentile(denoised_map[i][denoised_map[i] > 0], 99.999)) / np.percentile(denoised_map[i][denoised_map[i] > 0], 99.999)
+    denoised_map = denoised_map.clip(min=0, max=np.percentile(denoised_map[denoised_map > 0], 99.999)) / np.percentile(denoised_map[denoised_map > 0], 99.999)
+    combine_tensors_to_gif(
+        tensors={
+            "raw_map": raw_map,
+            "denoised_map": denoised_map
+        },
+        output_path="combined_tensors.gif",
+        fps=2,
+        cmap="grey"
+    )    
 
-paramsFolder = "./params"
-_, current_epochs = get_all_files(paramsFolder)
-if current_epochs != 0:
-    model.load_state_dict(torch.load(f'params/checkPoint_{current_epochs - 1}'))
-devices = try_all_gpus()
-model = model.to(device=devices[0])
-raw_maps = get_all_files()

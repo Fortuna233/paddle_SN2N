@@ -137,9 +137,14 @@ class myDataset(Dataset):
     
 
     def __getitem__(self, index):
+        file_path = self.file_list[index]
+        data = np.load(file_path)['arr_0']
+        filename = os.path.basename(file_path)
+        parts = os.path.splitext(filename)[0].split("_")
+        chunk_positions = np.array(parts, dtype=int)[1:]  # 跳过map_index，取x,y,z坐标
         if self.is_train:
-            return self.train_augs(torch.from_numpy(np.load(self.file_list[index])['arr_0'])), np.array(os.path.splitext(os.path.basename(self.file_list[index]))[0].split("_"), dtype=int)[1:]
-        return torch.from_numpy(np.load(self.file_list[index])['arr_0']), np.array(os.path.splitext(os.path.basename(self.file_list[index]))[0].split("_"), dtype=int)[1:]
+            return self.train_augs(torch.from_numpy(data)), chunk_positions
+        return torch.from_numpy(data), chunk_positions
 
 
 def fourier_interpolate(tensor, scale_factor=2):
@@ -275,6 +280,11 @@ def get_dataset(save_path, batch_size, DDP=False):
 def train(model, num_epochs=300, batch_size=24, accumulation_steps=4):
     total_params = sum(p.numel() for p in model.parameters())
     print(f"num_parameters: {total_params}")  
+
+    devices = try_all_gpus()
+    model = model.to(device=devices[0])
+    # model = DataParallel(model, device_ids=[0, 1, 2])
+    model = torch.compile(model)
     def init_weights(m):
         if type(m) == nn.Linear or type(m) == nn.Conv3d:  
             nn.init.xavier_uniform_(m.weight)
@@ -283,10 +293,6 @@ def train(model, num_epochs=300, batch_size=24, accumulation_steps=4):
     _, current_epochs = get_all_files(paramsFolder)
     if current_epochs != 0:
         model.load_state_dict(torch.load(f'params/checkPoint_{current_epochs - 1}'))
-    devices = try_all_gpus()
-    model = model.to(device=devices[0])
-    # model = DataParallel(model, device_ids=[0, 1, 2])
-    model = torch.compile(model)
     train_iter, vali_iter = get_dataset(save_path='./datasets', batch_size=batch_size)
     trainer = torch.optim.AdamW(model.parameters(), lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-2, amsgrad=False)
     scheduler = OneCycleLR(trainer, max_lr=0.01, total_steps=batch_size*len(train_iter), pct_start=0.3, anneal_strategy='cos', cycle_momentum=True, base_momentum=0.85, max_momentum=0.95,div_factor=25,final_div_factor=1e5)
@@ -375,14 +381,15 @@ def predict(map_shape, map_index, model, box_size=48):
     predSet = myDataset(predictData, is_train=False)
     pred_iter = DataLoader(predSet, batch_size=48, shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
 
-    paramsFolder = "./params"
-    _, current_epochs = get_all_files(paramsFolder)
-    if current_epochs != 0:
-        model.load_state_dict(torch.load(f'params/checkPoint_{current_epochs - 1}'))
+
     devices = try_all_gpus()
     model = model.to(device=devices[0])
     # model = DataParallel(model, device_ids=[0, 1, 2])
     model = torch.compile(model)
+    paramsFolder = "./params"
+    _, current_epochs = get_all_files(paramsFolder)
+    if current_epochs != 0:
+        model.load_state_dict(torch.load(f'params/checkPoint_{current_epochs - 1}'))
 
     map = np.zeros(tuple(dim + 2 * box_size for dim in map_shape), dtype=np.float32)
     denominator = np.zeros_like(map)

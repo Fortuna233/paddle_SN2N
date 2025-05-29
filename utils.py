@@ -235,7 +235,6 @@ def combine_tensors_to_gif(
             fig.colorbar(ims[0], cax=cbar_ax)
         
         # Render figure to numpy array
-        plt.tight_layout()
         fig.canvas.draw()
         frame = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
         frame = frame.reshape(fig.canvas.get_width_height()[::-1] + (3,))
@@ -346,7 +345,7 @@ def train(model, num_epochs=300, batch_size=24, accumulation_steps=4):
                 X = X.reshape(batch_size, channels, *spatial_dims)
                 Y = Y.reshape(batch_size, channels, *spatial_dims)
                 l = loss_channels(X, Y)
-                vali_loss += l
+                vali_loss += l.item()
         vali_Loss.append(vali_loss / len(vali_iter))
 
 
@@ -371,47 +370,49 @@ def train(model, num_epochs=300, batch_size=24, accumulation_steps=4):
     plt.show()
 
 
-# input raw_map and output prediction file and a gif of to map
-def predict(map_shape, map_index, model, box_size=48):
+# input raw_map and output prediction file
+def predict(map_shape, map_index, box_size=48):
     
     predicFolder = './predictions'
     chunk_files = [os.path.join(predicFolder, f) for f in os.listdir(predicFolder) if f.endswith('.npz') and int(os.path.splitext(f)[0].split("_")[0]) == map_index]
 
-    predictData = myDataset(chunk_files, is_train=True)
-    predSet = myDataset(predictData, is_train=False)
+    predSet = myDataset(chunk_files, is_train=False)
     pred_iter = DataLoader(predSet, batch_size=48, shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
-
-
+    model = UNet(spatial_dims=3, in_channels=1, out_channels=1, channels=[4, 8, 16, 32],
+                 strides=(2, 2, 2), num_res_units=2)
     devices = try_all_gpus()
     model = model.to(device=devices[0])
-    # model = DataParallel(model, device_ids=[0, 1, 2])
     model = torch.compile(model)
     paramsFolder = "./params"
     _, current_epochs = get_all_files(paramsFolder)
     if current_epochs != 0:
         model.load_state_dict(torch.load(f'params/checkPoint_{current_epochs - 1}'))
+        print(f'load params/checkPoint_{current_epochs - 1}')
+    devices = try_all_gpus()
+
+    # model = DataParallel(model, device_ids=[0, 1, 2])
+    
 
     map = np.zeros(tuple(dim + 2 * box_size for dim in map_shape), dtype=np.float32)
     denominator = np.zeros_like(map)
 
     with torch.no_grad():
         for i, (X, chunk_positions) in enumerate(pred_iter):
-            X = X.to(devices[0])
-            X = model(X)
-
+            X = X.reshape(X.shape[0], 1, box_size, box_size, box_size).to(devices[0])
+            X = model(X).reshape(-1, box_size, box_size, box_size).cpu()
             for chunk, chunk_position in zip(X.numpy(), chunk_positions):
-                map[chunk_position[0]:chunk_position + box_size,
-                    chunk_position[1]:chunk_position + box_size,
-                    chunk_position[2]:chunk_position + box_size] += chunk
-                denominator[chunk_position[0]:chunk_position + box_size,
-                    chunk_position[1]:chunk_position + box_size,
-                    chunk_position[2]:chunk_position + box_size] += 1
+                map[chunk_position[0]:chunk_position[0] + box_size,
+                    chunk_position[1]:chunk_position[1] + box_size,
+                    chunk_position[2]:chunk_position[2] + box_size] += chunk
+                denominator[chunk_position[0]:chunk_position[0] + box_size,
+                    chunk_position[1]:chunk_position[1] + box_size,
+                    chunk_position[2]:chunk_position[2] + box_size] += 1
                 
             for index, chunk_position in enumerate(chunk_positions):
                 filepath = os.path.join('./predictions', f"{map_index}_{chunk_position[0]}_{chunk_position[1]}_{chunk_position[2]}")
                 np.savez_compressed(filepath, X[index, :, :, :].numpy())
                 print(f"[{i}/{len(pred_iter)}] save {filepath}")
-
+    
     return (map / denominator.clip(min=1))[box_size : map_shape[0] + box_size, box_size : map_shape[1] + box_size, box_size : map_shape[2] + box_size]
 
 

@@ -122,7 +122,7 @@ def split_and_save_tensor(map_file, save_dir, map_index, minPercent=0, maxPercen
                 print(f"Error processing chunk: {e}")
     
     print(f"Total chunks processed: {len(chunk_coords_list)}")
-    return len(chunk_coords_list)
+    return len(chunk_coords_list), map_shape
 
 
 class myDataset(Dataset):
@@ -371,15 +371,14 @@ def train(model, num_epochs=300, batch_size=24, accumulation_steps=4):
 
 
 # input raw_map and output prediction file
-def predict(map_shape, map_index, box_size=48):
+def predict(model, map_shape, map_index, box_size=48):
     
     predicFolder = './predictions'
     chunk_files = [os.path.join(predicFolder, f) for f in os.listdir(predicFolder) if f.endswith('.npz') and int(os.path.splitext(f)[0].split("_")[0]) == map_index]
 
     predSet = myDataset(chunk_files, is_train=False)
     pred_iter = DataLoader(predSet, batch_size=48, shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
-    model = UNet(spatial_dims=3, in_channels=1, out_channels=1, channels=[4, 8, 16, 32],
-                 strides=(2, 2, 2), num_res_units=2)
+
     devices = try_all_gpus()
     model = model.to(device=devices[0])
     model = torch.compile(model)

@@ -18,8 +18,11 @@ accumulation_steps = 5
 save_path = "/home/tyche/paddle_SN2N/datasets"
 # save_path = "/data1/ryi/paddle_SN2N/datasets"
 
-model = UNet(spatial_dims=3, in_channels=1, out_channels=1, channels=[4, 8, 16, 32],
-             strides=(2, 2, 2),
+model = UNet(spatial_dims=3,
+             in_channels=1,
+             out_channels=1,
+             channels=[16, 32, 64, 128, 256],
+             strides=(2, 2, 2, 2, 2),
              num_res_units=2)
 
 

@@ -18,12 +18,11 @@ from torch.utils.data import Dataset, DataLoader
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from sklearn.model_selection import train_test_split
 import time
-import argparse
 import torch.backends
 import torch.utils
+from scunet import SCUNet
 from monai.networks.nets import UNet
 from torch.amp import GradScaler, autocast
-from torch.optim import AdamW
 from torch.nn import DataParallel
 import torch.distributed as dist
 from torch.optim.lr_scheduler import OneCycleLR
@@ -130,7 +129,6 @@ class myDataset(Dataset):
         self.file_list = file_list
         self.is_train = is_train
         self.train_augs = T.Compose([T.RandomHorizontalFlip(p=0.5), T.RandomVerticalFlip(p=0.5)])
- 
 
     def __len__(self):
         return len(self.file_list)
@@ -145,7 +143,7 @@ class myDataset(Dataset):
         if self.is_train:
             return self.train_augs(torch.from_numpy(data)), chunk_positions
         return torch.from_numpy(data), chunk_positions
-
+        
 
 def fourier_interpolate(tensor, scale_factor=2):
     assert tensor.ndim == 5, "[B, C, D, H, W]"
@@ -177,12 +175,12 @@ def fourier_interpolate(tensor, scale_factor=2):
     
     tensor_interpolated = fft.irfftn(tensor_fft_padded, s=(new_d, new_h, new_w), dim=(-3, -2, -1))
     
-    # tensor_interpolated = tensor_interpolated * (scale_factor ** 3)
+    tensor_interpolated = tensor_interpolated * (scale_factor ** 3)
     return tensor_interpolated
 
 
 def resample(batch_chunks, kernel):
-    kernel = kernel.view(kernel.shape[0], 1, 2, 2, 2)
+    kernel = kernel.view(-1, 1, 2, 2, 2)
     chunks_shape = batch_chunks.shape
     batch_chunks = batch_chunks.view(chunks_shape[0], 1, chunks_shape[1], chunks_shape[2], chunks_shape[3])
     conv_layer = nn.Conv3d(in_channels=1, out_channels=kernel.shape[0], kernel_size=2, stride=2, padding=0, bias=False)
@@ -248,41 +246,34 @@ def combine_tensors_to_gif(
     print(f"GIF saved to: {output_path}")
 
 
-# 定义损失函数
-def loss(pred, target):
-    smooth_l1_loss = nn.SmoothL1Loss(beta=1.0, reduction='mean')
-    return smooth_l1_loss(pred, target) + 1 - ssim(pred, target, data_range=1.0, size_average=True)
+def loss_channels(X, Y, gamma=2, beta=0.5):
+    def loss(pred, target, gamma, eps=1e-8):
+        diff = torch.abs(pred - target)
+        loss = (diff + eps) ** gamma
+        return loss.mean() 
+    num_channels = X.shape[1]
+    i_indices, j_indices = torch.triu_indices(num_channels, num_channels, offset=1)
+    l_xy = loss(X[:, i_indices].reshape(-1, *X.shape[2:]), Y[:, j_indices].reshape(-1, *Y.shape[2:]), gamma) + loss(X[:, j_indices].reshape(-1, *X.shape[2:]), Y[:, i_indices].reshape(-1, *Y.shape[2:]), gamma)
+    l_yy = loss(Y[:, i_indices].reshape(-1, *Y.shape[2:]), Y[:, j_indices].reshape(-1, *Y.shape[2:]), gamma)
+    return (l_xy + beta * l_yy) / (2 + beta)
 
 
-def loss_channels(X, Y, loss_fun=nn.MSELoss()):
-    l = 0
-    for i in range(X.shape[1]):
-        for j in range(X.shape[1]):
-            if i > j:
-                l += loss_fun(X[:, i, :, :, :], Y[:, j, :, : ,:]) 
-                l += loss_fun(X[:, j, :, :, :], Y[:, i, :, : ,:])
-                l += loss_fun(Y[:, i, :, :, :], Y[:, j, :, : ,:])
-    return l
-
-
-def get_dataset(save_path, batch_size, DDP=False):
-    chunkList, n_chunks = get_all_files(save_path)
+def get_dataset(save_path, batch_size):
     chunks_file = [os.path.join(save_path, f) for f in os.listdir(save_path) if f.endswith('.npz')]
     trainData, valiData = train_test_split(chunks_file, test_size=0.25, random_state=42)
     trainSet = myDataset(trainData, is_train=True)
     valiSet = myDataset(valiData, is_train=False)
     train_iter = DataLoader(trainSet, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True, prefetch_factor=2)
-    vali_iter = DataLoader(trainSet, batch_size=batch_size, shuffle=False, num_workers=4 * torch.cuda.device_count(), pin_memory=True, prefetch_factor=2)
+    vali_iter = DataLoader(valiSet, batch_size=batch_size, shuffle=False, num_workers=4 * torch.cuda.device_count(), pin_memory=True, prefetch_factor=2)
     return train_iter, vali_iter
 
 
-def train(model, num_epochs=300, batch_size=24, accumulation_steps=4):
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"num_parameters: {total_params}")  
+def train(rank, world_size, model, num_epochs=20, batch_size=16, accumulation_steps=6):
+    setup(rank, world_size)
 
-    devices = try_all_gpus()
-    model = model.to(device=devices[0])
-    # model = DataParallel(model, device_ids=[0, 1, 2])
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"num_parameters: {total_params}")
+    model = create_ddp_model(rank=rank, model=model)  
     model = torch.compile(model)
     def init_weights(m):
         if type(m) == nn.Linear or type(m) == nn.Conv3d:  
@@ -292,7 +283,14 @@ def train(model, num_epochs=300, batch_size=24, accumulation_steps=4):
     _, current_epochs = get_all_files(paramsFolder)
     if current_epochs != 0:
         model.load_state_dict(torch.load(f'params/checkPoint_{current_epochs - 1}'))
-    train_iter, vali_iter = get_dataset(save_path='./datasets', batch_size=batch_size)
+    save_path='./datasets'
+    chunks_file = [os.path.join(save_path, f) for f in os.listdir(save_path) if f.endswith('.npz')]
+    trainData, valiData = train_test_split(chunks_file, test_size=0.25, random_state=42)
+    trainSet = myDataset(trainData, is_train=True)
+    valiSet = myDataset(valiData, is_train=False)
+    train_iter = prepare_dataloader(trainSet, batch_size=batch_size, is_train=True)
+    vali_iter = prepare_dataloader(valiSet, batch_size=batch_size, is_train=False)
+
     trainer = torch.optim.AdamW(model.parameters(), lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-2, amsgrad=False)
     scheduler = OneCycleLR(trainer, max_lr=0.01, total_steps=batch_size*len(train_iter), pct_start=0.3, anneal_strategy='cos', cycle_momentum=True, base_momentum=0.85, max_momentum=0.95,div_factor=25,final_div_factor=1e5)
     scaler = GradScaler()
@@ -301,9 +299,11 @@ def train(model, num_epochs=300, batch_size=24, accumulation_steps=4):
     vali_Loss = []
     kernel = torch.tensor([[[[1, 0], [0, 1]], [[0, 1], [1, 0]]], 
                            [[[0, 1], [1, 0]], [[1, 0], [0, 1]]]]).float()
+
     starttime = time.time()
     for epoch in range(current_epochs, num_epochs):
-        # train_iter.sampler.set_epoch(epoch)
+        gamma =  2.0 - 2.0 / num_epochs * epoch
+        train_iter.sampler.set_epoch(epoch)
         train_loss = 0
         vali_loss = 0
         loss_batch = 0
@@ -311,15 +311,16 @@ def train(model, num_epochs=300, batch_size=24, accumulation_steps=4):
         for i, (X, _) in enumerate(train_iter):
             X = resample(X, kernel=kernel)
             batch_size, channels, *spatial_dims = X.shape
-            X = X.reshape(batch_size * channels, 1, *spatial_dims).to(devices[0])
+            X = X.reshape(batch_size * channels, 1, *spatial_dims).to(rank)
             with autocast(device_type='cuda'):
                 Y = model(X)
                 X = X.reshape(batch_size, channels, *spatial_dims)
                 Y = Y.reshape(batch_size, channels, *spatial_dims)
-                l = loss_channels(X, Y)
+                l = loss_channels(X, Y, gamma)
                 train_loss += l.item()
                 loss_batch += l.item() / accumulation_steps
                 del X, Y
+            
             scaler.scale(l).backward()
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             if (i + 1) % accumulation_steps == 0:
@@ -327,12 +328,13 @@ def train(model, num_epochs=300, batch_size=24, accumulation_steps=4):
                 scaler.update()
                 scheduler.step()
                 trainer.zero_grad(set_to_none=True)
-                Time = time.time() - starttime  
+                Time = time.time() - starttime
                 log_msg = f"[epoch: {epoch}] [processing: {i + 1}/{len(train_iter)}] [loss: {loss_batch}] [lr: {trainer.param_groups[0]['lr']}] [Time: {Time:.2f}s]"
-                print(log_msg)
-                loss_batch = 0
-                with open("output.log", "a") as file:
-                    file.write(log_msg + "\n")
+                if rank == 0:
+                    print(log_msg)
+                    loss_batch = 0
+                    with open("output.log", "a") as file:
+                        file.write(log_msg + "\n")
         epoch_loss = train_loss / len(train_iter)
         train_Loss.append(epoch_loss)
 
@@ -340,37 +342,41 @@ def train(model, num_epochs=300, batch_size=24, accumulation_steps=4):
             for (X, _) in vali_iter:
                 X = resample(X, kernel=kernel)
                 batch_size, channels, *spatial_dims = X.shape
-                X = X.reshape(batch_size * channels, 1, *spatial_dims).to(devices[0])
+                X = X.reshape(batch_size * channels, 1, *spatial_dims).to(rank)
                 Y = model(X)
                 X = X.reshape(batch_size, channels, *spatial_dims)
                 Y = Y.reshape(batch_size, channels, *spatial_dims)
-                l = loss_channels(X, Y)
+                l = loss_channels(X, Y, gamma)
                 vali_loss += l.item()
         vali_Loss.append(vali_loss / len(vali_iter))
 
-
+        
         log_msg = f"[epoch: {epoch}] [processing: {i + 1}/{len(train_iter)}] [train_loss: {loss_batch}] [vali_loss: {vali_Loss[-1]}] [lr: {trainer.param_groups[0]['lr']}] [Time: {Time:.2f}s]"
-        print(log_msg)
-        print(f"checkPoint_{epoch}")
-        print("=================================================================================================================")
-        with open("output.log", "a") as file:
-            file.write(log_msg + "\n")
-        # torch.save(model.module.state_dict(), f"params/checkPoint_{epoch}")
-        torch.save(model.state_dict(), f"params/checkPoint_{epoch}")
+        if rank == 0:
+            print(log_msg)
+            print(f"checkPoint_{epoch}")
+            print("=================================================================================================================")
+            with open("output.log", "a") as file:
+                file.write(log_msg + "\n")
+            if isinstance(model, torch.nn.DataParallel):
+                torch.save(model.module.state_dict(), f"params/checkPoint_{epoch}")
+            else:
+                torch.save(model.state_dict(), f"params/checkPoint_{epoch}")
     train_Loss = np.array(train_Loss)
     vali_Loss = np.array(vali_Loss)
-    np.savez_compressed('Loss.npz', train_Loss, vali_Loss)
+    np.savez_compressed('Loss.npz', train_Loss)
     plt.plot(range(num_epochs), train_Loss, label='train loss')
     plt.plot(range(num_epochs), vali_Loss, label='vali loss')
     plt.xlabel('Epoch')
-    plt.ylabel('log(Loss)')
+    plt.ylabel('Log(loss)')
+    plt.legend(loc='upper right')
     plt.yscale('log')
     plt.title('Training Loss')
     plt.savefig('training_loss.png')  # 保存图像
     plt.show()
 
 
-# input raw_map and output prediction file
+# input raw_map and output prediction file and a gif of to map
 def predict(model, map_shape, map_index, box_size=48):
     
     predicFolder = './predictions'
@@ -385,7 +391,9 @@ def predict(model, map_shape, map_index, box_size=48):
     paramsFolder = "./params"
     _, current_epochs = get_all_files(paramsFolder)
     if current_epochs != 0:
-        model.load_state_dict(torch.load(f'params/checkPoint_{current_epochs - 1}'))
+        state_dict = torch.load(f'params/checkPoint_{current_epochs - 1}')
+        new_state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+        model.load_state_dict(new_state_dict)
         print(f'load params/checkPoint_{current_epochs - 1}')
     devices = try_all_gpus()
 
@@ -399,7 +407,7 @@ def predict(model, map_shape, map_index, box_size=48):
         for i, (X, chunk_positions) in enumerate(pred_iter):
             X = X.reshape(X.shape[0], 1, box_size, box_size, box_size).to(devices[0])
             X = model(X).reshape(-1, box_size, box_size, box_size).cpu()
-            for chunk, chunk_position in zip(X.numpy(), chunk_positions):
+            for index, (chunk, chunk_position) in enumerate(zip(X.numpy(), chunk_positions)):
                 map[chunk_position[0]:chunk_position[0] + box_size,
                     chunk_position[1]:chunk_position[1] + box_size,
                     chunk_position[2]:chunk_position[2] + box_size] += chunk
@@ -407,11 +415,11 @@ def predict(model, map_shape, map_index, box_size=48):
                     chunk_position[1]:chunk_position[1] + box_size,
                     chunk_position[2]:chunk_position[2] + box_size] += 1
                 
-            for index, chunk_position in enumerate(chunk_positions):
+            # for index, chunk_position in enumerate(chunk_positions):
                 filepath = os.path.join('./predictions', f"{map_index}_{chunk_position[0]}_{chunk_position[1]}_{chunk_position[2]}")
                 np.savez_compressed(filepath, X[index, :, :, :].numpy())
                 print(f"[{i}/{len(pred_iter)}] save {filepath}")
-    
+
     return (map / denominator.clip(min=1))[box_size : map_shape[0] + box_size, box_size : map_shape[1] + box_size, box_size : map_shape[2] + box_size]
 
 
@@ -422,22 +430,29 @@ def get_map_from_predictions():
     print(chunk_positions)
     
 
-
-def init_ddp(local_rank):
-    torch.cuda.set_device(local_rank)
-    os.environp['RANK'] = str(local_rank) 
-    dist.init_process_group(backend='nccl', init_method='env://')
-
-
-def reduce_tensor(tensor: torch.Tensor):
-    rt = tensor.clone()
-    dist.all_reduce(rt, op=dist.reduce_op.SUM)
-    rt /= dist.get_world_size()
-    return rt
+def setup(rank, world_size):
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
 
 
-def get_ddp_generator(seed=42):
-    local_rank = dist.get_rank()
-    g = torch.Generator()
-    g.manual_seed(seed + local_rank)
-    return g
+def cleanup():
+    dist.destroy_process_group()
+
+
+def prepare_dataloader(dataset, batch_size, is_train=True):
+    if is_train:
+        sampler = DistributedSampler(dataset, shuffle=True)
+    else:
+        sampler = DistributedSampler(dataset, shuffle=False)
+    dataloader = DataLoader(dataset, batch_size=batch_size, pin_memory=True, sampler=sampler)
+    return dataloader
+
+
+def create_ddp_model(rank, model):
+    model = model.to(rank)
+    ddp_model = DDP(model, device_ids=[rank])
+    return ddp_model
+
+

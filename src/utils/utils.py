@@ -19,15 +19,12 @@ import torch.utils
 from torch import nn
 import torch.backends
 import torch.fft as fft
-import torch.distributed as dist
 import torchvision.transforms as T
-from torch.nn import functional as F
 from torch.amp import GradScaler, autocast
 from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import OneCycleLR
-from torch.utils.data.distributed import DistributedSampler
-from torch.nn.parallel import DistributedDataParallel as DDP
 
+from utils_ddp import *
 
 
 
@@ -370,7 +367,7 @@ def train(rank, world_size, model, num_epochs=20, batch_size=16, accumulation_st
     plt.show()
 
 
-# # input raw_map and output prediction file and a gif of to map
+# # input raw_map and output prediction file
 def predict(model, map_shape, map_index, box_size=48):
     predicFolder = './predictions'
     chunk_files = [os.path.join(predicFolder, f) for f in os.listdir(predicFolder) if f.endswith('.npz') and int(os.path.splitext(f)[0].split("_")[0]) == map_index]
@@ -414,36 +411,6 @@ def predict(model, map_shape, map_index, box_size=48):
     return (map / denominator.clip(min=1))[box_size : map_shape[0] + box_size, box_size : map_shape[1] + box_size, box_size : map_shape[2] + box_size]
 
 
-def get_map_from_predictions():
-    # chunk_files = [os.path.join('./predictions', f) for f in os.listdir('./predictions') if f.endswith('.npz')]
-    chunk_files = [os.path.join('../data/datasets', f) for f in os.listdir('./datasets') if f.endswith('.npz')]
-    chunk_positions = [os.path.splitext(os.path.basename(f))[0].split("_") for f in chunk_files]
-    print(chunk_positions)
-    
 
-def setup(rank, world_size):
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
-    torch.cuda.set_device(rank)
-
-
-def cleanup():
-    dist.destroy_process_group()
-
-
-def prepare_dataloader(dataset, batch_size, is_train=True):
-    if is_train:
-        sampler = DistributedSampler(dataset, shuffle=True)
-    else:
-        sampler = DistributedSampler(dataset, shuffle=False)
-    dataloader = DataLoader(dataset, batch_size=batch_size, pin_memory=True, sampler=sampler)
-    return dataloader
-
-
-def create_ddp_model(rank, model):
-    model = model.to(rank)
-    ddp_model = DDP(model, device_ids=[rank])
-    return ddp_model
 
 

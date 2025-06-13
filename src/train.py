@@ -1,18 +1,10 @@
-import os
-import time
 import torch
-import argparse
 import torch.backends
 import torch.utils
-import numpy as np
 from src.utils.utils import *
 from monai.networks.nets import UNet
 from scunet import SCUNet
-import torch.distributed as dist
 import torch.multiprocessing as mp
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data.distributed import DistributedSampler
-from torch.utils.data import DataLoader
 
 torch.backends.cudnn.benchmark = True
 save_path = "/home/tyche/paddle_SN2N/datasets"

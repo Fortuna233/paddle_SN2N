@@ -1,32 +1,30 @@
 import os
-import torch
+import time
 import imageio
 import mrcfile
 import tifffile
-from pathlib import Path
 import numpy as np
-from torch import nn
-from torch.nn import functional as F
-import torch.fft as fft
 import multiprocessing
+from pathlib import Path
 from functools import partial
-from pytorch_msssim import ssim
+from itertools import product
 import matplotlib.pyplot as plt
 from typing import Dict, Optional
-import torchvision.transforms as T
-from torch.utils.data import Dataset, DataLoader
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from sklearn.model_selection import train_test_split
-import time
-import torch.backends
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+
+import torch
 import torch.utils
-from scunet import SCUNet
-from monai.networks.nets import UNet
-from torch.amp import GradScaler, autocast
-from torch.nn import DataParallel
+from torch import nn
+import torch.backends
+import torch.fft as fft
 import torch.distributed as dist
+import torchvision.transforms as T
+from torch.nn import functional as F
+from torch.amp import GradScaler, autocast
+from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import OneCycleLR
-import torch.multiprocessing as mp
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -36,11 +34,9 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 def get_all_files(directory):
     file_list = []
-    n_files = 0
     for file in os.listdir(directory):
         file_list.append(f"{directory}/{file}")
-        n_files += 1
-    return sorted(file_list), n_files
+    return sorted(file_list)
 
 
 def try_all_gpus():
@@ -48,13 +44,41 @@ def try_all_gpus():
     return devices if devices else [torch.device('cpu')]
 
 
-def process_chunk(padded_map, map_file, save_dir, chunk_coords, box_size, map_index):
-    """处理单个数据块并保存"""
+def process_chunk(padded_map, save_dir, chunk_coords, box_size, map_index):
     cur_x, cur_y, cur_z = chunk_coords
     next_chunk = padded_map[cur_x:cur_x + box_size, cur_y:cur_y + box_size, cur_z:cur_z + box_size].numpy()
     filepath = os.path.join(save_dir, f'{map_index}_{cur_x}_{cur_y}_{cur_z}.npz')
     np.savez_compressed(filepath, next_chunk)
     return filepath, next_chunk.shape
+
+
+def normalize(map_data, minPercent=0, maxPercent=99.999, mode='3d'):
+    map_data = np.array(map_data)
+    
+    if mode.lower() == '3d':
+        min_val = np.percentile(map_data, minPercent)
+        max_val = np.percentile(map_data, maxPercent)
+        normalized_data = (map_data - min_val) / (max_val - min_val)
+    elif mode.lower() == '2d':
+        normalized_data = np.zeros_like(map_data, dtype=np.float32)
+        for z in range(map_data.shape[0]):
+            slice_data = map_data[z]
+            min_val = np.percentile(slice_data, minPercent)
+            max_val = np.percentile(slice_data, maxPercent)
+            normalized_data[z] = (slice_data - min_val) / (max_val - min_val)
+    else:
+        raise ValueError(f"Unsupported mode: {mode}, only 2d or 3d mode supported")
+    normalized_data = np.nan_to_num(normalized_data, nan=0.0, posinf=1.0, neginf=0.0)
+    return normalized_data
+
+
+def generate_chunk_coords(map_shape, box_size, stride):
+    start_point = box_size - stride
+    z_coords = np.arange(start_point, map_shape[0] + box_size, stride)
+    x_coords = np.arange(start_point, map_shape[1] + box_size, stride)
+    y_coords = np.arange(start_point, map_shape[2] + box_size, stride)
+    chunk_coords_list = list(product(z_coords, x_coords, y_coords))
+    return chunk_coords_list
 
 
 def split_and_save_tensor(map_file, save_dir, map_index, minPercent=0, maxPercent=99.999, box_size=48, stride=12):
@@ -72,54 +96,24 @@ def split_and_save_tensor(map_file, save_dir, map_index, minPercent=0, maxPercen
         map_data = np.array(tifffile.imread(map_file))
     else:
         print(f"unsupported filetype: {map_file.suffix}, only mrcfile and tifffile supported.")
-    # 归一化和填充
-    min_val = np.percentile(map_data, minPercent)
-    max_val = np.percentile(map_data, maxPercent)
-    map_data = map_data.clip(min=min_val, max=max_val) / max_val
+
+    map_data = normalize(map_data, minPercent=minPercent, maxPercent=maxPercent, mode='3d')
     map_shape = map_data.shape
-    
-    # 创建填充后的张量
     padded_map = np.full((map_shape[0] + 2 * box_size, map_shape[1] + 2 * box_size, map_shape[2] + 2 * box_size), 0.0, dtype=np.float32)
     padded_map[box_size : box_size + map_shape[0], box_size : box_size + map_shape[1], box_size : box_size + map_shape[2]] = map_data
-    
-    # 转换为PyTorch张量并设置为共享内存，避免每个进程复制
     padded_map = torch.from_numpy(padded_map)
     padded_map.share_memory_()
-    
-    # 生成所有块的坐标
-    start_point = box_size - stride
-    cur_x, cur_y, cur_z = start_point, start_point, start_point
-    chunk_coords_list = []
-    
-    while (cur_z + stride < map_shape[2] + box_size):
-        chunk_coords_list.append((cur_x, cur_y, cur_z))
-        
-        cur_x += stride
-        if (cur_x + stride >= map_shape[0] + box_size):
-            cur_y += stride
-            cur_x = start_point  # Reset X
-            if (cur_y + stride >= map_shape[1] + box_size):
-                cur_z += stride
-                cur_y = start_point  # Reset Y
-                cur_x = start_point  # Reset X
-    
-    # 设置并行工作进程数
+    chunk_coords_list = generate_chunk_coords(map_shape=map_shape, box_size=box_size, stride=stride)
     num_workers = multiprocessing.cpu_count()
-    
-    # 使用进程池并行处理
     process_func = partial(process_chunk, padded_map, map_file, save_dir, box_size=box_size, map_index=map_index)
-    
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
         futures = [executor.submit(process_func, coords) for coords in chunk_coords_list]
-        
-        # 收集结果
         for future in as_completed(futures):
             try:
                 filepath, chunk_shape = future.result()
                 print(f"filename: {filepath}, chunk_shape: {chunk_shape}")
             except Exception as e:
                 print(f"Error processing chunk: {e}")
-    
     print(f"Total chunks processed: {len(chunk_coords_list)}")
     return len(chunk_coords_list), map_shape
 

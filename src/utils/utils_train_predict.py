@@ -35,14 +35,14 @@ class myDataset(Dataset):
 
     def __getitem__(self, index):
         file_path = self.file_list[index]
-        data = np.load(file_path)['arr_0']
+        data = torch.load(file_path)
         filename = os.path.basename(file_path)
         parts = os.path.splitext(filename)[0].split("_")
-        chunk_positions = np.array(parts, dtype=int)[1:]  # 跳过map_index，取z, x, y坐标
+        chunk_positions = np.array(parts, dtype=int)[1:]  # skip map_index, get z,x,y positions
         if self.is_train:
-            return self.train_augs(torch.from_numpy(data)), chunk_positions
+            return self.train_augs(data), chunk_positions
         else:
-            return torch.from_numpy(data), chunk_positions
+            return data, chunk_positions
         
 
 def get_dataset(save_path, batch_size):
@@ -67,7 +67,7 @@ def loss_channels(X, Y, gamma=2, beta=0.5):
     return (l_xy + beta * l_yy) / (2 + beta)
 
 
-def train(rank, world_size, model, num_epochs=20, batch_size=16, accumulation_steps=6):
+def train(rank, world_size, model, num_epochs=20, batch_size=16, accumulation_steps=6, paramsFolder="./params", save_path='./datasets'):
     setup(rank, world_size)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -79,15 +79,15 @@ def train(rank, world_size, model, num_epochs=20, batch_size=16, accumulation_st
         if type(m) == nn.Linear or type(m) == nn.Conv3d:  
             nn.init.xavier_uniform_(m.weight)
     
-    paramsFolder = "./params"
+    
     current_epochs = len(get_all_files(paramsFolder))
     if current_epochs != 0:
         model.load_state_dict(torch.load(f'params/checkPoint_{current_epochs - 1}'))
     else:
         model.apply(init_weights)
 
-    save_path='./datasets'
-    chunks_file = [os.path.join(save_path, f) for f in os.listdir(save_path) if f.endswith('.npz')]
+    
+    chunks_file = [os.path.join(save_path, f) for f in os.listdir(save_path) if f.endswith('.pt')]
     trainData, valiData = train_test_split(chunks_file, test_size=0.25, random_state=42)
     trainSet = myDataset(trainData, is_train=True)
     valiSet = myDataset(valiData, is_train=False)
@@ -112,7 +112,6 @@ def train(rank, world_size, model, num_epochs=20, batch_size=16, accumulation_st
         loss_batch = 0
         model.train()
         for i, (X, _) in enumerate(train_iter):
-            X = resample(X, kernel=kernel)
             batch_size, channels, *spatial_dims = X.shape
             X = X.reshape(batch_size * channels, 1, *spatial_dims).to(rank)
             with autocast(device_type='cuda'):
@@ -130,20 +129,19 @@ def train(rank, world_size, model, num_epochs=20, batch_size=16, accumulation_st
                 scaler.step(trainer)
                 scaler.update()
                 scheduler.step()
-                trainer.zero_grad(set_to_none=True)
+                trainer.zero_grad()
                 Time = time.time() - starttime
                 log_msg = f"[epoch: {epoch}] [processing: {i + 1}/{len(train_iter)}] [loss: {loss_batch}] [lr: {trainer.param_groups[0]['lr']}] [Time: {Time:.2f}s]"
                 if rank == 0:
                     print(log_msg)
                     loss_batch = 0
-                    with open("output.log", "a") as file:
+                    with open("../../data/logs/output.log", "a") as file:
                         file.write(log_msg + "\n")
         epoch_loss = train_loss / len(train_iter)
         train_Loss.append(epoch_loss)
 
         with torch.no_grad():
             for (X, _) in vali_iter:
-                X = resample(X, kernel=kernel)
                 batch_size, channels, *spatial_dims = X.shape
                 X = X.reshape(batch_size * channels, 1, *spatial_dims).to(rank)
                 Y = model(X)
@@ -159,17 +157,19 @@ def train(rank, world_size, model, num_epochs=20, batch_size=16, accumulation_st
             print(log_msg)
             print(f"checkPoint_{epoch}")
             print("=================================================================================================================")
-            with open("output.log", "a") as file:
+            with open("../../data/logs/output.log", "a") as file:
                 file.write(log_msg + "\n")
             if isinstance(model, torch.nn.DataParallel):
-                torch.save(model.module.state_dict(), f"params/checkPoint_{epoch}")
+                torch.save(model.module.state_dict(), f"../../data/params/checkPoint_{epoch}")
             else:
-                torch.save(model.state_dict(), f"params/checkPoint_{epoch}")
+                torch.save(model.state_dict(), f"../../data/params/checkPoint_{epoch}")
     train_Loss = np.array(train_Loss)
     vali_Loss = np.array(vali_Loss)
+    gammas = np.linspace(2, 0, num_epochs)
     np.savez_compressed('Loss.npz', train_Loss)
     plt.plot(range(num_epochs), train_Loss, label='train loss')
     plt.plot(range(num_epochs), vali_Loss, label='vali loss')
+    plt.plot(range(num_epochs), gammas, label='gamma')
     plt.xlabel('Epoch')
     plt.ylabel('Log(loss)')
     plt.legend(loc='upper right')

@@ -45,9 +45,9 @@ def normalize(map_data, minPercent=0, maxPercent=99.999, mode='3d'):
 
 def generate_chunk_coords(map_shape, box_size, stride):
     start_point = box_size - stride
-    z_coords = np.arange(start_point, map_shape[0] + box_size, stride)
-    x_coords = np.arange(start_point, map_shape[1] + box_size, stride)
-    y_coords = np.arange(start_point, map_shape[2] + box_size, stride)
+    z_coords = torch.arange(start_point, map_shape[0] + box_size, stride)
+    x_coords = torch.arange(start_point, map_shape[1] + box_size, stride)
+    y_coords = torch.arange(start_point, map_shape[2] + box_size, stride)
     chunk_coords_list = list(product(z_coords, x_coords, y_coords))
     return chunk_coords_list
 
@@ -61,21 +61,25 @@ def process_chunk(padded_map, save_dir, chunk_coords, box_size, map_index, kerne
     return filepath, next_chunk.shape
 
 
-def split_and_save_tensor(map_file, save_dir, map_index, minPercent=0, maxPercent=99.999, box_size=48, stride=12):
+def split_and_save_tensor(kernel, map_file, save_dir, map_index, minPercent=0, maxPercent=99.999, box_size=48, stride=12):
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
-
+    
     map_path = Path(map_file)
-    if map_path.suffix == '.mrc':
-        print("mapFile:", map_file)
-        mrc = mrcfile.open(map_file, mode='r')
-        map_data = np.asarray(mrc.data.copy(), dtype=np.float32)
-        mrc.close()
-    elif map_path.suffix == '.tif':
-        print("mapFile:", map_file)
-        map_data = np.array(tifffile.imread(map_file))
-    else:
-        print(f"unsupported filetype: {map_file.suffix}, only mrcfile and tifffile supported.")
+    try:
+        if map_path.suffix == '.mrc':
+            print(f"Loading mrc file: {map_file}")
+            with mrcfile.open(map_file, mode='r') as mrc:
+                map_data = np.asarray(mrc.data.copy(), dtype=np.float32)
+        elif map_path.suffix == '.tif':
+            print.info(f"Loading tif file: {map_file}")
+            map_data = np.array(tifffile.imread(map_file))
+        else:
+            print.warning(f"Unsupported filetype: {map_path.suffix}, only .mrc and .tif are supported.")
+    except Exception as e:
+        print(f"Error loading file {map_file}: {str(e)}")
+        map_data = None
+        return map_data
 
     map_data = normalize(map_data, minPercent=minPercent, maxPercent=maxPercent, mode='3d')
     map_shape = map_data.shape
@@ -85,7 +89,7 @@ def split_and_save_tensor(map_file, save_dir, map_index, minPercent=0, maxPercen
     padded_map.share_memory_()
     chunk_coords_list = generate_chunk_coords(map_shape=map_shape, box_size=box_size, stride=stride)
     num_workers = multiprocessing.cpu_count()
-    process_func = partial(process_chunk, padded_map, map_file, save_dir, box_size=box_size, map_index=map_index)
+    process_func = partial(process_chunk, padded_map, map_file, save_dir, box_size=box_size, map_index=map_index, kernel=kernel)
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
         futures = [executor.submit(process_func, coords) for coords in chunk_coords_list]
         for future in as_completed(futures):

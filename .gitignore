@@ -4,5 +4,5 @@
 **/*.tif
 **/*.git
 **/*.gif
-
+.vscode
 

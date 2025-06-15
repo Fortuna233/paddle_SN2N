@@ -1,7 +1,5 @@
 import os
-import torch
-import torch.utils
-import torch.backends
+from torch.cuda import set_device
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -10,7 +8,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 def setup(rank, world_size, gpu_ids=None):
     if gpu_ids is not None:
-        torch.cuda.set_device(gpu_ids[rank])
+        set_device(gpu_ids[rank])
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
     dist.init_process_group("nccl", rank=rank, world_size=world_size)

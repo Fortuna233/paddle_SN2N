@@ -1,5 +1,5 @@
 import numpy as np
-from utils.utils import *
+from ..utils.utils_dataprocessing import get_all_files, split_and_save_tensor
 
 
 

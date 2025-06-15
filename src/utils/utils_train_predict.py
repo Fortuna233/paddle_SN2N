@@ -38,7 +38,7 @@ class myDataset(Dataset):
         data = torch.load(file_path)
         filename = os.path.basename(file_path)
         parts = os.path.splitext(filename)[0].split("_")
-        chunk_positions = np.array(parts, dtype=int)[1:]  # skip map_index, get z,x,y positions
+        chunk_positions = torch.tensor(parts, dtype=torch.int8)[1:]  # skip map_index, get z,x,y positions
         if self.is_train:
             return self.train_augs(data), chunk_positions
         else:
@@ -82,20 +82,20 @@ def train(rank, world_size, model, num_epochs=20, batch_size=16, accumulation_st
     
     current_epochs = len(get_all_files(paramsFolder))
     if current_epochs != 0:
-        model.load_state_dict(torch.load(f'params/checkPoint_{current_epochs - 1}'))
+        model.load_state_dict(torch.load(f'../../data/params/checkPoint_{current_epochs - 1}'))
     else:
         model.apply(init_weights)
 
     
     chunks_file = [os.path.join(save_path, f) for f in os.listdir(save_path) if f.endswith('.pt')]
-    trainData, valiData = train_test_split(chunks_file, test_size=0.25, random_state=42)
+    trainData, valiData = train_test_split(chunks_file, test_size=0.1, random_state=42)
     trainSet = myDataset(trainData, is_train=True)
     valiSet = myDataset(valiData, is_train=False)
     train_iter = prepare_dataloader(trainSet, batch_size=batch_size, is_train=True)
     vali_iter = prepare_dataloader(valiSet, batch_size=batch_size, is_train=False)
 
     trainer = torch.optim.AdamW(model.parameters(), lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-2, amsgrad=False)
-    scheduler = OneCycleLR(trainer, max_lr=0.01, total_steps=batch_size*len(train_iter), pct_start=0.3, anneal_strategy='cos', cycle_momentum=True, base_momentum=0.85, max_momentum=0.95,div_factor=25,final_div_factor=1e5)
+    scheduler = OneCycleLR(trainer, max_lr=1e-3, total_steps=batch_size*len(train_iter), pct_start=0.3, anneal_strategy='cos', cycle_momentum=True, base_momentum=0.85, max_momentum=0.95,div_factor=25,final_div_factor=1e5)
     scaler = GradScaler()
 
     train_Loss = []
@@ -166,7 +166,6 @@ def train(rank, world_size, model, num_epochs=20, batch_size=16, accumulation_st
     train_Loss = np.array(train_Loss)
     vali_Loss = np.array(vali_Loss)
     gammas = np.linspace(2, 0, num_epochs)
-    np.savez_compressed('Loss.npz', train_Loss)
     plt.plot(range(num_epochs), train_Loss, label='train loss')
     plt.plot(range(num_epochs), vali_Loss, label='vali loss')
     plt.plot(range(num_epochs), gammas, label='gamma')
@@ -179,34 +178,34 @@ def train(rank, world_size, model, num_epochs=20, batch_size=16, accumulation_st
     plt.show()
 
 
-
-
-
 # # input raw_map and output prediction file
-def predict(model, map_shape, map_index, box_size=48):
-    predicFolder = './predictions'
-    chunk_files = [os.path.join(predicFolder, f) for f in os.listdir(predicFolder) if f.endswith('.npz') and int(os.path.splitext(f)[0].split("_")[0]) == map_index]
+def predict(rank, world_size, model, map_shape, map_index, box_size=48):
+    setup(rank, world_size)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"num_parameters: {total_params}")
+
+    model = create_ddp_model(rank=rank, model=model) 
+    model = torch.compile(model)
+    def init_weights(m):
+        if type(m) == nn.Linear or type(m) == nn.Conv3d:  
+            nn.init.xavier_uniform_(m.weight)
+    paramsFolder = "../../data/params/"
+    _, current_epochs = get_all_files(paramsFolder)
+    if current_epochs != 0:
+        model.load_state_dict(torch.load(f'{paramsFolder}/checkPoint_{current_epochs - 1}'))
+        print(f'load {paramsFolder}/checkPoint_{current_epochs - 1}')
+    else:
+        model.apply(init_weights)
+    devices = try_all_gpus()
+
+    predictFolder = '../../data/datasets'
+    chunk_files = [os.path.join(predictFolder, f) for f in os.listdir(predictFolder) if f.endswith('.pt') and int(os.path.splitext(f)[0].split("_")[0]) == map_index]
 
     predSet = myDataset(chunk_files, is_train=False)
     pred_iter = DataLoader(predSet, batch_size=48, shuffle=False, num_workers=4, pin_memory=True, prefetch_factor=2)
 
-    devices = try_all_gpus()
-    model = model.to(device=devices[0])
-    model = torch.compile(model)
-    paramsFolder = "./params"
-    _, current_epochs = get_all_files(paramsFolder)
-    if current_epochs != 0:
-        state_dict = torch.load(f'params/checkPoint_{current_epochs - 1}')
-        new_state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-        model.load_state_dict(new_state_dict)
-        print(f'load params/checkPoint_{current_epochs - 1}')
-    devices = try_all_gpus()
-
-    # model = DataParallel(model, device_ids=[0, 1, 2])
-    
-
-    map = np.zeros(tuple(dim + 2 * box_size for dim in map_shape), dtype=np.float32)
-    denominator = np.zeros_like(map)
+    map = torch.zeros(tuple(dim + 2 * box_size for dim in map_shape), dtype=np.float32)
+    denominator = torch.zeros_like(map)
 
     with torch.no_grad():
         for i, (X, chunk_positions) in enumerate(pred_iter):
@@ -219,8 +218,8 @@ def predict(model, map_shape, map_index, box_size=48):
                 denominator[chunk_position[0]:chunk_position[0] + box_size,
                     chunk_position[1]:chunk_position[1] + box_size,
                     chunk_position[2]:chunk_position[2] + box_size] += 1
-                # filepath = os.path.join('./predictions', f"{map_index}_{chunk_position[0]}_{chunk_position[1]}_{chunk_position[2]}")
-                # np.savez_compressed(filepath, X[index, :, :, :].numpy())
+                filepath = os.path.join('../../data/predictions', f"{map_index}_{chunk_position[0]}_{chunk_position[1]}_{chunk_position[2]}")
+                torch.save(X[index, :, :, :], filepath)
                 print(f"[predicting: {i}/{len(pred_iter)}]")
 
     return (map / denominator.clip(min=1))[box_size : map_shape[0] + box_size, box_size : map_shape[1] + box_size, box_size : map_shape[2] + box_size]

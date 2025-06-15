@@ -52,16 +52,34 @@ def generate_chunk_coords(map_shape, box_size, stride):
     return chunk_coords_list
 
 
-def process_chunk(padded_map, save_dir, chunk_coords, box_size, map_index, kernel):
+# interpolate first and resample
+# can process both 2d and 3d tensors
+def resample(batch_chunks, kernel):
+    out_channels, *spatial_dims = kernel.shape
+    kernel = kernel.view(out_channels, 1, spatial_dims)
+    batch_size, *chunks_shape = batch_chunks.shape
+    batch_chunks = batch_chunks.view(batch_size, 1, chunks_shape)
+    batch_chunks = torch.functional.interpolate(batch_chunks, scale_factor=2, mode='trilinear')
+    if len(spatial_dims) == 3:
+        conv_layer = nn.Conv3d(in_channels=1, out_channels=kernel.shape[0], kernel_size=2, stride=2, padding=0, bias=False)
+    elif len(spatial_dims) == 2:
+        conv_layer = nn.Conv2d(in_channels=1, out_channels=out_channels, kernel_size=2, stride=2, padding=0, bias=False)
+    conv_layer.weight.data = kernel
+    batch_chunks = conv_layer(batch_chunks)
+    return batch_chunks
+
+
+def process_chunk(padded_map, save_dir, chunk_coords, box_size, map_index, kernel, is_train=True):
     cur_x, cur_y, cur_z = chunk_coords
     next_chunk = padded_map[cur_x:cur_x + box_size, cur_y:cur_y + box_size, cur_z:cur_z + box_size]
-    next_chunk = resample(next_chunk, kernel)
+    if is_train:
+        next_chunk = resample(next_chunk, kernel)
     filepath = os.path.join(save_dir, f'{map_index}_{cur_x}_{cur_y}_{cur_z}.pt')
     torch.save(next_chunk, filepath,  _use_new_zipfile_serialization=True)
     return filepath, next_chunk.shape
 
 
-def split_and_save_tensor(kernel, map_file, save_dir, map_index, minPercent=0, maxPercent=99.999, box_size=48, stride=12):
+def split_and_save_tensor(kernel, map_file, save_dir, map_index, minPercent=0, maxPercent=99.999, box_size=48, stride=12, is_train=True):
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
     
@@ -89,7 +107,7 @@ def split_and_save_tensor(kernel, map_file, save_dir, map_index, minPercent=0, m
     padded_map.share_memory_()
     chunk_coords_list = generate_chunk_coords(map_shape=map_shape, box_size=box_size, stride=stride)
     num_workers = multiprocessing.cpu_count()
-    process_func = partial(process_chunk, padded_map, map_file, save_dir, box_size=box_size, map_index=map_index, kernel=kernel)
+    process_func = partial(process_chunk, padded_map, map_file, save_dir, box_size=box_size, map_index=map_index, kernel=kernel, is_train=is_train)
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
         futures = [executor.submit(process_func, coords) for coords in chunk_coords_list]
         for future in as_completed(futures):
@@ -120,21 +138,6 @@ def split_and_save_tensor(kernel, map_file, save_dir, map_index, minPercent=0, m
 #     return tensor_interpolated
 
 
-# interpolate first and resample
-# can process both 2d and 3d tensors
-def resample(batch_chunks, kernel):
-    out_channels, *spatial_dims = kernel.shape
-    kernel = kernel.view(out_channels, 1, spatial_dims)
-    batch_size, *chunks_shape = batch_chunks.shape
-    batch_chunks = batch_chunks.view(batch_size, 1, chunks_shape)
-    batch_chunks = torch.functional.interpolate(batch_chunks, scale_factor=2, mode='trilinear')
-    if len(spatial_dims) == 3:
-        conv_layer = nn.Conv3d(in_channels=1, out_channels=kernel.shape[0], kernel_size=2, stride=2, padding=0, bias=False)
-    elif len(spatial_dims) == 2:
-        conv_layer = nn.Conv2d(in_channels=1, out_channels=out_channels, kernel_size=2, stride=2, padding=0, bias=False)
-    conv_layer.weight.data = kernel
-    batch_chunks = conv_layer(batch_chunks)
-    return batch_chunks
 
 
 def combine_tensors_to_gif(

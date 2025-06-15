@@ -14,7 +14,6 @@ from typing import Dict, Optional
 import torch
 from torch import nn
 import torch.fft as fft
-
 from utils_ddp import *
 
 
@@ -23,15 +22,6 @@ def get_all_files(directory):
     for file in os.listdir(directory):
         file_list.append(f"{directory}/{file}")
     return sorted(file_list)
-
-
-def process_chunk(padded_map, save_dir, chunk_coords, box_size, map_index):
-    cur_x, cur_y, cur_z = chunk_coords
-    next_chunk = padded_map[cur_x:cur_x + box_size, cur_y:cur_y + box_size, cur_z:cur_z + box_size].numpy()
-    filepath = os.path.join(save_dir, f'{map_index}_{cur_x}_{cur_y}_{cur_z}.npz')
-    np.savez_compressed(filepath, next_chunk)
-    return filepath, next_chunk.shape
-
 
 def normalize(map_data, minPercent=0, maxPercent=99.999, mode='3d'):
     map_data = np.array(map_data)
@@ -60,6 +50,15 @@ def generate_chunk_coords(map_shape, box_size, stride):
     y_coords = np.arange(start_point, map_shape[2] + box_size, stride)
     chunk_coords_list = list(product(z_coords, x_coords, y_coords))
     return chunk_coords_list
+
+
+def process_chunk(padded_map, save_dir, chunk_coords, box_size, map_index, kernel):
+    cur_x, cur_y, cur_z = chunk_coords
+    next_chunk = padded_map[cur_x:cur_x + box_size, cur_y:cur_y + box_size, cur_z:cur_z + box_size]
+    next_chunk = resample(next_chunk, kernel)
+    filepath = os.path.join(save_dir, f'{map_index}_{cur_x}_{cur_y}_{cur_z}.pt')
+    torch.save(next_chunk, filepath,  _use_new_zipfile_serialization=True)
+    return filepath, next_chunk.shape
 
 
 def split_and_save_tensor(map_file, save_dir, map_index, minPercent=0, maxPercent=99.999, box_size=48, stride=12):
@@ -95,47 +94,40 @@ def split_and_save_tensor(map_file, save_dir, map_index, minPercent=0, maxPercen
                 print(f"filename: {filepath}, chunk_shape: {chunk_shape}")
             except Exception as e:
                 print(f"Error processing chunk: {e}")
-    print(f"Total chunks processed: {len(chunk_coords_list)}")
+    print(f"Number of chunks processed: {len(chunk_coords_list)}")
     return len(chunk_coords_list), map_shape
 
 
-def fourier_interpolate(tensor, scale_factor=2):
-    assert tensor.ndim == 5, "[B, C, D, H, W]"
+# def fourier_interpolate(tensor, scale_factor=2.0):
+#     dim = tuple(range(2, tensor.ndim))
+#     tensor_fft = fft.rfftn(tensor, dim=dim)
+#     tensor_shape = tensor.shape
+#     tensor_shape[2:] *= scale_factor
     
-    # 3D FFT
-    tensor_fft = fft.rfftn(tensor, dim=(-3, -2, -1))
-    batch_size, channels, d, h, w = tensor.shape
+#     tensor_fft_padded = torch.zeros(
+#         tuple(tensor_shape),
+#         dtype=tensor_fft.dtype,
+#         device=tensor_fft.device
+#     )
+#     starts = (tensor_shape[2:] - tensor.shape[2:]) // 2
     
-    new_d = d * scale_factor
-    new_h = h * scale_factor
-    new_w = w * scale_factor
-    
-    tensor_fft_padded = torch.zeros(
-        (batch_size, channels, new_d, new_h, new_w),
-        dtype=tensor_fft.dtype,
-        device=tensor_fft.device
-    )
-    d_start = (new_d - d) // 2
-    h_start = (new_h - h) // 2
-    w_start = (new_w - w) // 2 
-    
-    tensor_fft_padded[
-        :, :, 
-        d_start:d_start+d, 
-        h_start:h_start+h, 
-        w_start:w_start+w] = tensor_fft
-    tensor_interpolated = fft.irfftn(tensor_fft_padded, s=(new_d, new_h, new_w), dim=(-3, -2, -1))
-    tensor_interpolated = tensor_interpolated * (scale_factor ** 3)
-    return tensor_interpolated
+#     tensor_fft_padded[:, :, starts:starts+tensor.shape[2:]] = tensor_fft
+#     tensor_interpolated = fft.irfftn(tensor_fft_padded, s=tuple(tensor_shape[2:]), dim=dim)
+#     return tensor_interpolated
 
 
+# interpolate first and resample
+# can process both 2d and 3d tensors
 def resample(batch_chunks, kernel):
-    kernel = kernel.view(-1, 1, 2, 2, 2)
-    chunks_shape = batch_chunks.shape
-    batch_chunks = batch_chunks.view(chunks_shape[0], 1, chunks_shape[1], chunks_shape[2], chunks_shape[3])
-    batch_chunks = fourier_interpolate(batch_chunks, scale_factor=2)
-    # return F.interpolate(batch_chunks, scale_factor=2, mode='trilinear')
-    conv_layer = nn.Conv3d(in_channels=1, out_channels=kernel.shape[0], kernel_size=2, stride=2, padding=0, bias=False)
+    out_channels, *spatial_dims = kernel.shape
+    kernel = kernel.view(out_channels, 1, spatial_dims)
+    batch_size, *chunks_shape = batch_chunks.shape
+    batch_chunks = batch_chunks.view(batch_size, 1, chunks_shape)
+    batch_chunks = torch.functional.interpolate(batch_chunks, scale_factor=2, mode='trilinear')
+    if len(spatial_dims) == 3:
+        conv_layer = nn.Conv3d(in_channels=1, out_channels=kernel.shape[0], kernel_size=2, stride=2, padding=0, bias=False)
+    elif len(spatial_dims) == 2:
+        conv_layer = nn.Conv2d(in_channels=1, out_channels=out_channels, kernel_size=2, stride=2, padding=0, bias=False)
     conv_layer.weight.data = kernel
     batch_chunks = conv_layer(batch_chunks)
     return batch_chunks

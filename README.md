@@ -1,33 +1,11 @@
-[![Github commit](https://img.shields.io/github/last-commit/WeisongZhao/SN2N)](https://github.com/WeisongZhao/SN2N/)
-[![Github All Releases](https://img.shields.io/github/downloads/WeisongZhao/SN2N/total.svg)](https://github.com/WeisongZhao/SN2N/releases/tag/v0.3.2/)
-[![License](https://img.shields.io/github/license/WeisongZhao/SN2N)](https://github.com/WeisongZhao/SN2N/blob/master/LICENSE/)
-[![paper](https://img.shields.io/badge/paper-nat.%20methods-black.svg)](https://www.nature.com/articles/s41592-024-02400-9/)
-[![releases](https://img.shields.io/badge/release-v0.3.5-FF6600.svg)](https://github.com/WeisongZhao/SN2N/releases/tag/v0.3.5/)
-<br>
-
-[![Twitter](https://img.shields.io/twitter/follow/QuLiying?label=liying)](https://twitter.com/QuLiying)
-[![Twitter](https://img.shields.io/twitter/follow/weisong_zhao?label=weisong)](https://twitter.com/weisong_zhao)
-[![GitHub stars](https://img.shields.io/github/stars/WeisongZhao/SN2N?style=social)](https://github.com/WeisongZhao/SN2N/) 
 
 
 
 <p>
 <h1 align="center">SN<font color="#FF6600">2</font>N</h1>
 <h5 align="center">Self-inspired learning to denoise for live-cell super-resolution microscopy.</h5>
-<h6 align="right">v0.3.5</h6>
 </p>
 
-
-
-
-
-<br>
-
-
-<p>
-<img src='./imgs/4color-small.gif' align="left" width=190>
-</p>
-<br>
 
 
 This repository is for our developed self-inspired Noise2Noise (SN2N) learning-to-denoise engine, and it will be in continued development. It is distributed as accompanying software for publication: [Liying Qu et al. Self-inspired learning for denoising live-cell super-resolution microscopy, 21, 1895–1908, Nature Methods (2024)](https://www.nature.com/articles/s41592-024-02400-9). Please cite SN2N in your publications, if it helps your research.

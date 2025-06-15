@@ -264,16 +264,21 @@ def train(rank, world_size, model, num_epochs=20, batch_size=16, accumulation_st
 
     total_params = sum(p.numel() for p in model.parameters())
     print(f"num_parameters: {total_params}")
+    
     model = create_ddp_model(rank=rank, model=model)  
     model = torch.compile(model)
     def init_weights(m):
         if type(m) == nn.Linear or type(m) == nn.Conv3d:  
             nn.init.xavier_uniform_(m.weight)
-    model.apply(init_weights)
+    
     paramsFolder = "./params"
-    _, current_epochs = get_all_files(paramsFolder)
+    
+    current_epochs = len(get_all_files(paramsFolder))
     if current_epochs != 0:
         model.load_state_dict(torch.load(f'params/checkPoint_{current_epochs - 1}'))
+    else:
+        model.apply(init_weights)
+
     save_path='./datasets'
     chunks_file = [os.path.join(save_path, f) for f in os.listdir(save_path) if f.endswith('.npz')]
     trainData, valiData = train_test_split(chunks_file, test_size=0.25, random_state=42)

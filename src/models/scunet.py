@@ -24,7 +24,7 @@ from einops import rearrange
 from einops.layers.torch import Rearrange
 from timm.layers import trunc_normal_, DropPath
 
-from frn import FilterResponseNorm3d
+from src.models.frn import FilterResponseNorm3d
 
 class WMSA(nn.Module):
     def __init__(self, input_dim, output_dim, head_dim, window_size, type):

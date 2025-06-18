@@ -1,5 +1,5 @@
 import numpy as np
-from ..utils.utils_dataprocessing import get_all_files, split_and_save_tensor
+from src.utils.utils_dataprocessing import get_all_files, split_and_save_tensor
 
 
 
@@ -15,5 +15,5 @@ print(raw_map_list)
 
 n_chunks, i = 0, 0
 for i, mapfile in enumerate(raw_map_list):
-    n_chunks += split_and_save_tensor(mapfile, save_path, map_index=i)
+    n_chunks += split_and_save_tensor(mapfile, save_path, map_index=i, minPercent=0, maxPercent=99.999, box_size=48, stride=12, is_train=True)
     print(f'processing: {i}/{len(raw_map_list)}')

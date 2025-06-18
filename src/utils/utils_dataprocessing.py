@@ -13,8 +13,8 @@ from typing import Dict, Optional
 
 import torch
 from torch import nn
-import torch.fft as fft
-from utils_ddp import *
+# import torch.fft as fft
+from src.utils.utils_ddp import *
 
 
 def get_all_files(directory):
@@ -45,41 +45,22 @@ def normalize(map_data, minPercent=0, maxPercent=99.999, mode='3d'):
 
 def generate_chunk_coords(map_shape, box_size, stride):
     start_point = box_size - stride
-    z_coords = torch.arange(start_point, map_shape[0] + box_size, stride)
-    x_coords = torch.arange(start_point, map_shape[1] + box_size, stride)
-    y_coords = torch.arange(start_point, map_shape[2] + box_size, stride)
-    chunk_coords_list = list(product(z_coords, x_coords, y_coords))
+    z_coords = np.arange(start_point, map_shape[0] + box_size, stride)
+    x_coords = np.arange(start_point, map_shape[1] + box_size, stride)
+    y_coords = np.arange(start_point, map_shape[2] + box_size, stride)
+    chunk_coords_list = product(z_coords, x_coords, y_coords)
     return chunk_coords_list
 
 
-# interpolate first and resample
-# can process both 2d and 3d tensors
-def resample(batch_chunks, kernel):
-    out_channels, *spatial_dims = kernel.shape
-    kernel = kernel.view(out_channels, 1, spatial_dims)
-    batch_size, *chunks_shape = batch_chunks.shape
-    batch_chunks = batch_chunks.view(batch_size, 1, chunks_shape)
-    batch_chunks = torch.functional.interpolate(batch_chunks, scale_factor=2, mode='trilinear')
-    if len(spatial_dims) == 3:
-        conv_layer = nn.Conv3d(in_channels=1, out_channels=kernel.shape[0], kernel_size=2, stride=2, padding=0, bias=False)
-    elif len(spatial_dims) == 2:
-        conv_layer = nn.Conv2d(in_channels=1, out_channels=out_channels, kernel_size=2, stride=2, padding=0, bias=False)
-    conv_layer.weight.data = kernel
-    batch_chunks = conv_layer(batch_chunks)
-    return batch_chunks
-
-
-def process_chunk(padded_map, save_dir, chunk_coords, box_size, map_index, kernel, is_train=True):
+def process_chunk(padded_map, save_dir, chunk_coords, box_size, map_index):
     cur_x, cur_y, cur_z = chunk_coords
-    next_chunk = padded_map[cur_x:cur_x + box_size, cur_y:cur_y + box_size, cur_z:cur_z + box_size]
-    if is_train:
-        next_chunk = resample(next_chunk, kernel)
-    filepath = os.path.join(save_dir, f'{map_index}_{cur_x}_{cur_y}_{cur_z}.pt')
-    torch.save(next_chunk, filepath,  _use_new_zipfile_serialization=True)
+    next_chunk = padded_map[cur_x:cur_x + box_size, cur_y:cur_y + box_size, cur_z:cur_z + box_size].numpy()
+    filepath = os.path.join(save_dir, f'{map_index}_{cur_x}_{cur_y}_{cur_z}.npz')
+    np.savez_compressed(filepath, next_chunk)
     return filepath, next_chunk.shape
 
 
-def split_and_save_tensor(kernel, map_file, save_dir, map_index, minPercent=0, maxPercent=99.999, box_size=48, stride=12, is_train=True):
+def split_and_save_tensor(map_file, save_dir, map_index, minPercent=0, maxPercent=99.999, box_size=48, stride=12):
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
     
@@ -90,7 +71,7 @@ def split_and_save_tensor(kernel, map_file, save_dir, map_index, minPercent=0, m
             with mrcfile.open(map_file, mode='r') as mrc:
                 map_data = np.asarray(mrc.data.copy(), dtype=np.float32)
         elif map_path.suffix == '.tif':
-            print.info(f"Loading tif file: {map_file}")
+            print(f"Loading tif file: {map_file}")
             map_data = np.array(tifffile.imread(map_file))
         else:
             print.warning(f"Unsupported filetype: {map_path.suffix}, only .mrc and .tif are supported.")
@@ -103,13 +84,15 @@ def split_and_save_tensor(kernel, map_file, save_dir, map_index, minPercent=0, m
     map_shape = map_data.shape
     padded_map = np.full((map_shape[0] + 2 * box_size, map_shape[1] + 2 * box_size, map_shape[2] + 2 * box_size), 0.0, dtype=np.float32)
     padded_map[box_size : box_size + map_shape[0], box_size : box_size + map_shape[1], box_size : box_size + map_shape[2]] = map_data
+    del map_data
+
     padded_map = torch.from_numpy(padded_map)
     padded_map.share_memory_()
     chunk_coords_list = generate_chunk_coords(map_shape=map_shape, box_size=box_size, stride=stride)
     num_workers = multiprocessing.cpu_count()
-    process_func = partial(process_chunk, padded_map, map_file, save_dir, box_size=box_size, map_index=map_index, kernel=kernel, is_train=is_train)
+    process_func = partial(process_chunk, padded_map=padded_map, save_dir=save_dir, box_size=box_size, map_index=map_index)
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        futures = [executor.submit(process_func, coords) for coords in chunk_coords_list]
+        futures = [executor.submit(process_func, chunk_coords=coords) for coords in chunk_coords_list]
         for future in as_completed(futures):
             try:
                 filepath, chunk_shape = future.result()
@@ -137,7 +120,24 @@ def split_and_save_tensor(kernel, map_file, save_dir, map_index, minPercent=0, m
 #     tensor_interpolated = fft.irfftn(tensor_fft_padded, s=tuple(tensor_shape[2:]), dim=dim)
 #     return tensor_interpolated
 
-
+# interpolate first and resample
+# can process both 2d and 3d tensors
+def resample(batch_chunks, kernel):
+    out_channels, *spatial_dims = kernel.shape
+    kernel = kernel.view(out_channels, 1, *spatial_dims)
+    batch_size, *chunks_shape = batch_chunks.shape
+    batch_chunks = batch_chunks.view(batch_size, 1, chunks_shape)
+    print(spatial_dims)
+    print(chunks_shape)
+    if len(spatial_dims) == 3:
+        batch_chunks = torch.nn.functional.interpolate(batch_chunks, scale_factor=2, mode='trilinear')
+        conv_layer = nn.Conv3d(in_channels=1, out_channels=out_channels, kernel_size=2, stride=2, padding=0, bias=False)
+    elif len(spatial_dims) == 2:
+        batch_chunks = torch.nn.functional.interpolate(batch_chunks, scale_factor=2, mode='bilinear')
+        conv_layer = nn.Conv2d(in_channels=1, out_channels=out_channels, kernel_size=2, stride=2, padding=0, bias=False)
+    conv_layer.weight.data = kernel
+    batch_chunks = conv_layer(batch_chunks)
+    return batch_chunks
 
 
 def combine_tensors_to_gif(

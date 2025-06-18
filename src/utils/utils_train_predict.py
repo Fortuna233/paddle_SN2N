@@ -1,8 +1,11 @@
 import os
 import time
+from datetime import datetime
+
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
+
 
 
 from sympy import im
@@ -14,8 +17,8 @@ from torch.amp import GradScaler, autocast
 from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import OneCycleLR
 
-from utils_ddp import *
-from utils_dataprocessing import get_all_files, resample
+from src.utils.utils_ddp import *
+from src.utils.utils_dataprocessing import get_all_files, resample
 
 
 def try_all_gpus():
@@ -35,19 +38,18 @@ class myDataset(Dataset):
 
     def __getitem__(self, index):
         file_path = self.file_list[index]
-        data = torch.load(file_path)
+        data = np.load(file_path)['arr_0']
         filename = os.path.basename(file_path)
         parts = os.path.splitext(filename)[0].split("_")
-        chunk_positions = torch.tensor(parts, dtype=torch.int8)[1:]  # skip map_index, get z,x,y positions
+        chunk_positions = np.array(parts, dtype=int)[1:]  # 跳过map_index，取x,y,z坐标
         if self.is_train:
-            return self.train_augs(data), chunk_positions
-        else:
-            return data, chunk_positions
+            return self.train_augs(torch.from_numpy(data)), chunk_positions
+        return torch.from_numpy(data), chunk_positions
         
 
 def get_dataset(save_path, batch_size):
     chunks_file = [os.path.join(save_path, f) for f in os.listdir(save_path) if f.endswith('.npz')]
-    trainData, valiData = train_test_split(chunks_file, test_size=0.25, random_state=42)
+    trainData, valiData = train_test_split(chunks_file, test_size=0.1, random_state=42)
     trainSet = myDataset(trainData, is_train=True)
     valiSet = myDataset(valiData, is_train=False)
     train_iter = DataLoader(trainSet, batch_size=batch_size, shuffle=True, num_workers=4 * torch.cuda.device_count(), pin_memory=True, prefetch_factor=2)
@@ -67,7 +69,7 @@ def loss_channels(X, Y, gamma=2, beta=0.5):
     return (l_xy + beta * l_yy) / (2 + beta)
 
 
-def train(rank, world_size, model, num_epochs=20, batch_size=16, accumulation_steps=6, paramsFolder="./params", save_path='./datasets'):
+def train(rank, world_size, model, paramsFolder, datasetsFolder, logsFolder, num_epochs, batch_size, accumulation_steps):
     setup(rank, world_size)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -76,18 +78,18 @@ def train(rank, world_size, model, num_epochs=20, batch_size=16, accumulation_st
     model = create_ddp_model(rank=rank, model=model)  
     model = torch.compile(model)
     def init_weights(m):
-        if type(m) == nn.Linear or type(m) == nn.Conv3d:  
+        if type(m) == nn.Linear or type(m) == nn.Conv3d or type(m) == nn.Conv2d:  
             nn.init.xavier_uniform_(m.weight)
     
     
     current_epochs = len(get_all_files(paramsFolder))
     if current_epochs != 0:
-        model.load_state_dict(torch.load(f'../../data/params/checkPoint_{current_epochs - 1}'))
+        model.load_state_dict(torch.load(f'{paramsFolder}/checkPoint_{current_epochs - 1}'))
     else:
         model.apply(init_weights)
 
     
-    chunks_file = [os.path.join(save_path, f) for f in os.listdir(save_path) if f.endswith('.pt')]
+    chunks_file = [os.path.join(datasetsFolder, f) for f in os.listdir(datasetsFolder) if f.endswith('.npz')]
     trainData, valiData = train_test_split(chunks_file, test_size=0.1, random_state=42)
     trainSet = myDataset(trainData, is_train=True)
     valiSet = myDataset(valiData, is_train=False)
@@ -100,10 +102,12 @@ def train(rank, world_size, model, num_epochs=20, batch_size=16, accumulation_st
 
     train_Loss = []
     vali_Loss = []
-    kernel = torch.tensor([[[[1, 0], [0, 1]], [[0, 1], [1, 0]]], 
-                           [[[0, 1], [1, 0]], [[1, 0], [0, 1]]]]).float()
+
 
     starttime = time.time()
+    local_now = datetime.now()
+    if rank==0:
+        print(local_now)
     for epoch in range(current_epochs, num_epochs):
         gamma =  2.0 - 2.0 / num_epochs * epoch
         train_iter.sampler.set_epoch(epoch)
@@ -135,7 +139,7 @@ def train(rank, world_size, model, num_epochs=20, batch_size=16, accumulation_st
                 if rank == 0:
                     print(log_msg)
                     loss_batch = 0
-                    with open("../../data/logs/output.log", "a") as file:
+                    with open(f"{logsFolder}/output_{local_now}.log", "a") as file:
                         file.write(log_msg + "\n")
         epoch_loss = train_loss / len(train_iter)
         train_Loss.append(epoch_loss)
@@ -157,12 +161,12 @@ def train(rank, world_size, model, num_epochs=20, batch_size=16, accumulation_st
             print(log_msg)
             print(f"checkPoint_{epoch}")
             print("=================================================================================================================")
-            with open("../../data/logs/output.log", "a") as file:
-                file.write(log_msg + "\n")
+            with open(f"{logsFolder}/output_{local_now}.log", "a") as file:
+                file.write(log_msg + "\n")  
             if isinstance(model, torch.nn.DataParallel):
-                torch.save(model.module.state_dict(), f"../../data/params/checkPoint_{epoch}")
+                torch.save(model.module.state_dict(), f"{paramsFolder}/checkPoint_{epoch}")
             else:
-                torch.save(model.state_dict(), f"../../data/params/checkPoint_{epoch}")
+                torch.save(model.state_dict(), f"{paramsFolder}/checkPoint_{epoch}")
     train_Loss = np.array(train_Loss)
     vali_Loss = np.array(vali_Loss)
     gammas = np.linspace(2, 0, num_epochs)
@@ -170,7 +174,7 @@ def train(rank, world_size, model, num_epochs=20, batch_size=16, accumulation_st
     plt.plot(range(num_epochs), vali_Loss, label='vali loss')
     plt.plot(range(num_epochs), gammas, label='gamma')
     plt.xlabel('Epoch')
-    plt.ylabel('Log(loss)')
+    plt.ylabel('log of loss')
     plt.legend(loc='upper right')
     plt.yscale('log')
     plt.title('Training Loss')
@@ -179,7 +183,7 @@ def train(rank, world_size, model, num_epochs=20, batch_size=16, accumulation_st
 
 
 # # input raw_map and output prediction file
-def predict(rank, world_size, model, map_shape, map_index, box_size=48):
+def predict(rank, world_size, model, map_shape, map_index, box_size):
     setup(rank, world_size)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"num_parameters: {total_params}")

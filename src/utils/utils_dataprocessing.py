@@ -23,19 +23,24 @@ def get_all_files(directory):
         file_list.append(f"{directory}/{file}")
     return sorted(file_list)
 
+
 def normalize(map_data, minPercent=0, maxPercent=99.999, mode='3d'):
     map_data = np.array(map_data)
     
     if mode.lower() == '3d':
         min_val = np.percentile(map_data, minPercent)
         max_val = np.percentile(map_data, maxPercent)
+        map_data = np.clip(map_data, min_val, max_val)
         normalized_data = (map_data - min_val) / (max_val - min_val)
     elif mode.lower() == '2d':
+        if map_data.ndim == 2:
+            map_data = map_data.reshape(-1, map_data.shape[0], map_data.shape[1])
         normalized_data = np.zeros_like(map_data, dtype=np.float32)
         for z in range(map_data.shape[0]):
             slice_data = map_data[z]
             min_val = np.percentile(slice_data, minPercent)
             max_val = np.percentile(slice_data, maxPercent)
+            slice_data = np.clip(slice_data, min_val, max_val)
             normalized_data[z] = (slice_data - min_val) / (max_val - min_val)
     else:
         raise ValueError(f"Unsupported mode: {mode}, only 2d or 3d mode supported")
@@ -48,21 +53,21 @@ def generate_chunk_coords(map_shape, box_size, stride):
     z_coords = np.arange(start_point, map_shape[0] + box_size, stride)
     x_coords = np.arange(start_point, map_shape[1] + box_size, stride)
     y_coords = np.arange(start_point, map_shape[2] + box_size, stride)
-    chunk_coords_list = product(z_coords, x_coords, y_coords)
-    return chunk_coords_list
+    chunk_coords_generator = product(z_coords, x_coords, y_coords)
+    return chunk_coords_generator
 
 
-def process_chunk(padded_map, save_dir, chunk_coords, box_size, map_index):
+def process_chunk(padded_map, datasetsFolder, chunk_coords, box_size, map_index):
     cur_x, cur_y, cur_z = chunk_coords
     next_chunk = padded_map[cur_x:cur_x + box_size, cur_y:cur_y + box_size, cur_z:cur_z + box_size].numpy()
-    filepath = os.path.join(save_dir, f'{map_index}_{cur_x}_{cur_y}_{cur_z}.npz')
+    filepath = os.path.join(datasetsFolder, f'{map_index}_{cur_x}_{cur_y}_{cur_z}.npz')
     np.savez_compressed(filepath, next_chunk)
     return filepath, next_chunk.shape
 
 
-def split_and_save_tensor(map_file, save_dir, map_index, minPercent=0, maxPercent=99.999, box_size=48, stride=12):
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
+def split_and_save_tensor(map_file, datasetsFolder, map_index, minPercent=0, maxPercent=99.999, box_size=48, stride=12):
+    if not os.path.exists(datasetsFolder):
+        os.makedirs(datasetsFolder)
     
     map_path = Path(map_file)
     try:
@@ -88,19 +93,18 @@ def split_and_save_tensor(map_file, save_dir, map_index, minPercent=0, maxPercen
 
     padded_map = torch.from_numpy(padded_map)
     padded_map.share_memory_()
-    chunk_coords_list = generate_chunk_coords(map_shape=map_shape, box_size=box_size, stride=stride)
+    chunk_coords_generator = generate_chunk_coords(map_shape=map_shape, box_size=box_size, stride=stride)
     num_workers = multiprocessing.cpu_count()
-    process_func = partial(process_chunk, padded_map=padded_map, save_dir=save_dir, box_size=box_size, map_index=map_index)
+    process_func = partial(process_chunk, padded_map=padded_map, datasetsFolder=datasetsFolder, box_size=box_size, map_index=map_index)
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
-        futures = [executor.submit(process_func, chunk_coords=coords) for coords in chunk_coords_list]
+        futures = [executor.submit(process_func, chunk_coords=coords) for coords in chunk_coords_generator]
         for future in as_completed(futures):
             try:
                 filepath, chunk_shape = future.result()
                 print(f"filename: {filepath}, chunk_shape: {chunk_shape}")
             except Exception as e:
                 print(f"Error processing chunk: {e}")
-    print(f"Number of chunks processed: {len(chunk_coords_list)}")
-    return len(chunk_coords_list), map_shape
+    return map_shape
 
 
 # def fourier_interpolate(tensor, scale_factor=2.0):
@@ -126,17 +130,18 @@ def resample(batch_chunks, kernel):
     out_channels, *spatial_dims = kernel.shape
     kernel = kernel.view(out_channels, 1, *spatial_dims)
     batch_size, *chunks_shape = batch_chunks.shape
-    batch_chunks = batch_chunks.view(batch_size, 1, chunks_shape)
-    print(spatial_dims)
-    print(chunks_shape)
+    batch_chunks = batch_chunks.view(batch_size, 1, *chunks_shape)
+    
     if len(spatial_dims) == 3:
-        batch_chunks = torch.nn.functional.interpolate(batch_chunks, scale_factor=2, mode='trilinear')
         conv_layer = nn.Conv3d(in_channels=1, out_channels=out_channels, kernel_size=2, stride=2, padding=0, bias=False)
+        conv_layer.weight.data = kernel
+        batch_chunks = conv_layer(batch_chunks)
+        batch_chunks = torch.nn.functional.interpolate(batch_chunks, scale_factor=2, mode='trilinear')
     elif len(spatial_dims) == 2:
-        batch_chunks = torch.nn.functional.interpolate(batch_chunks, scale_factor=2, mode='bilinear')
         conv_layer = nn.Conv2d(in_channels=1, out_channels=out_channels, kernel_size=2, stride=2, padding=0, bias=False)
-    conv_layer.weight.data = kernel
-    batch_chunks = conv_layer(batch_chunks)
+        conv_layer.weight.data = kernel
+        batch_chunks = conv_layer(batch_chunks)
+        batch_chunks = torch.nn.functional.interpolate(batch_chunks, scale_factor=2, mode='bilinear')
     return batch_chunks
 
 

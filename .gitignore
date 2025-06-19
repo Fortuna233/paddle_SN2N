@@ -6,3 +6,4 @@
 **/*.gif
 .vscode
 
+**/src.egg-info

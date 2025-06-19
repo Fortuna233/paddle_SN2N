@@ -48,24 +48,33 @@ def normalize(map_data, minPercent=0, maxPercent=99.999, mode='3d'):
     return normalized_data
 
 
-def generate_chunk_coords(map_shape, box_size, stride):
+def generate_chunk_coords(map_shape, box_size, stride, mode='3d'):
     start_point = box_size - stride
-    z_coords = np.arange(start_point, map_shape[0] + box_size, stride)
-    x_coords = np.arange(start_point, map_shape[1] + box_size, stride)
-    y_coords = np.arange(start_point, map_shape[2] + box_size, stride)
-    chunk_coords_generator = product(z_coords, x_coords, y_coords)
+    if mode == '3d':
+        z_coords = np.arange(start_point, map_shape[0] + box_size, stride)
+        x_coords = np.arange(start_point, map_shape[1] + box_size, stride)
+        y_coords = np.arange(start_point, map_shape[2] + box_size, stride)
+        chunk_coords_generator = product(z_coords, x_coords, y_coords)
+    elif mode == '2d':
+        z_coords = np.arange(box_size - 1, map_shape[0] + box_size, 1)
+        x_coords = np.arange(start_point, map_shape[1] + box_size, stride)
+        y_coords = np.arange(start_point, map_shape[2] + box_size, stride)
+        chunk_coords_generator = product(z_coords, x_coords, y_coords)
     return chunk_coords_generator
 
 
-def process_chunk(padded_map, datasetsFolder, chunk_coords, box_size, map_index):
-    cur_x, cur_y, cur_z = chunk_coords
-    next_chunk = padded_map[cur_x:cur_x + box_size, cur_y:cur_y + box_size, cur_z:cur_z + box_size].numpy()
-    filepath = os.path.join(datasetsFolder, f'{map_index}_{cur_x}_{cur_y}_{cur_z}.npz')
+def process_chunk(padded_map, datasetsFolder, chunk_coords, box_size, map_index, mode='3d'):
+    cur_z, cur_x, cur_y = chunk_coords
+    if mode == '3d':
+        next_chunk = padded_map[cur_z:cur_z + box_size, cur_x:cur_x + box_size, cur_y:cur_y + box_size].numpy()
+    elif mode == '2d':
+        next_chunk = padded_map[cur_z, cur_x:cur_x + box_size, cur_y:cur_y + box_size].numpy()
+    filepath = os.path.join(datasetsFolder, f'{map_index}_{cur_z}_{cur_x}_{cur_y}.npz')
     np.savez_compressed(filepath, next_chunk)
     return filepath, next_chunk.shape
 
 
-def split_and_save_tensor(map_file, datasetsFolder, map_index, minPercent=0, maxPercent=99.999, box_size=48, stride=12):
+def split_and_save_tensor(map_file, datasetsFolder, map_index, minPercent=0, maxPercent=99.999, box_size=48, stride=12, mode='3d'):
     if not os.path.exists(datasetsFolder):
         os.makedirs(datasetsFolder)
     
@@ -85,17 +94,19 @@ def split_and_save_tensor(map_file, datasetsFolder, map_index, minPercent=0, max
         map_data = None
         return map_data
 
-    map_data = normalize(map_data, minPercent=minPercent, maxPercent=maxPercent, mode='3d')
+    map_data = normalize(map_data, minPercent=minPercent, maxPercent=maxPercent, mode=mode)
     map_shape = map_data.shape
+    if len(map_shape) == 2:
+        map_data = map_data.reshape(-1, *map_shape)
     padded_map = np.full((map_shape[0] + 2 * box_size, map_shape[1] + 2 * box_size, map_shape[2] + 2 * box_size), 0.0, dtype=np.float32)
     padded_map[box_size : box_size + map_shape[0], box_size : box_size + map_shape[1], box_size : box_size + map_shape[2]] = map_data
     del map_data
 
     padded_map = torch.from_numpy(padded_map)
     padded_map.share_memory_()
-    chunk_coords_generator = generate_chunk_coords(map_shape=map_shape, box_size=box_size, stride=stride)
+    chunk_coords_generator = generate_chunk_coords(map_shape=map_shape, box_size=box_size, stride=stride, mode=mode)
     num_workers = multiprocessing.cpu_count()
-    process_func = partial(process_chunk, padded_map=padded_map, datasetsFolder=datasetsFolder, box_size=box_size, map_index=map_index)
+    process_func = partial(process_chunk, padded_map=padded_map, datasetsFolder=datasetsFolder, box_size=box_size, map_index=map_index, mode=mode)
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
         futures = [executor.submit(process_func, chunk_coords=coords) for coords in chunk_coords_generator]
         for future in as_completed(futures):

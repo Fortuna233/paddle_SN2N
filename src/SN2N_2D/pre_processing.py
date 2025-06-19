@@ -8,7 +8,7 @@ print(raw_map_list)
 
 
 for i, mapfile in enumerate(raw_map_list):
-    result = split_and_save_tensor(mapfile, datasetsFolder, map_index=i, minPercent=0, maxPercent=99.999, box_size=box_size, stride=stride)
+    result = split_and_save_tensor(mapfile, datasetsFolder, map_index=i, minPercent=0, maxPercent=99.999, box_size=box_size, stride=stride, mode='2d')
     print(f'processing: {i + 1}/{len(raw_map_list)}')
 
 

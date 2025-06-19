@@ -69,7 +69,7 @@ def loss_channels(X, Y, gamma=2, beta=0.5):
     return (l_xy + beta * l_yy) / (2 + beta)
 
 
-def train(rank, world_size, model, paramsFolder, datasetsFolder, logsFolder, num_epochs, batch_size, accumulation_steps):
+def train(rank, world_size, model, kernel, paramsFolder, datasetsFolder, logsFolder, num_epochs, batch_size, accumulation_steps):
     setup(rank, world_size)
 
     if rank == 0:
@@ -103,16 +103,7 @@ def train(rank, world_size, model, paramsFolder, datasetsFolder, logsFolder, num
 
     train_Loss = []
     vali_Loss = []
-    kernel = torch.tensor([[[[0, 1], [1, 1]], [[1, 1], [1, 1]]],
-                       [[[1, 0], [1, 1]], [[1, 1], [1, 1]]],
-                       [[[1, 1], [0, 1]], [[1, 1], [1, 1]]],
-                       [[[1, 1], [1, 0]], [[1, 1], [1, 1]]],
-                       [[[1, 1], [1, 1]], [[0, 1], [1, 1]]],
-                       [[[1, 1], [1, 1]], [[1, 0], [1, 1]]],
-                       [[[1, 1], [1, 1]], [[1, 1], [0, 1]]],
-                       [[[1, 1], [1, 1]], [[1, 1], [1, 0]]]]).float() / 7
-    # kernel = torch.tensor([[[[1, 0], [0, 1]], [[0, 1], [1, 0]]], 
-    #                        [[[0, 1], [1, 0]], [[1, 0], [0, 1]]]]).float() / 4   
+
 
     starttime = time.time()
     local_now = datetime.now()

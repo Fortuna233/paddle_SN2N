@@ -5,5 +5,5 @@
 **/*.git
 **/*.gif
 .vscode
-
+**/params
 **/src.egg-info

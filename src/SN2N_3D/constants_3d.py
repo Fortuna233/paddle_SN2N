@@ -25,17 +25,9 @@ resultFolder = '/home/tyche/paddle_SN2N/data/results'
 #                        [[[1, 1], [1, 1]], [[1, 0], [1, 1]]],
 #                        [[[1, 1], [1, 1]], [[1, 1], [0, 1]]],
 #                        [[[1, 1], [1, 1]], [[1, 1], [1, 0]]]]).float() / 7
-# kernel = torch.tensor([[[[1, 0], [0, 1]], [[0, 1], [1, 0]]], 
-#                        [[[0, 1], [1, 0]], [[1, 0], [0, 1]]]]).float() / 4   
-
-# kernel = torch.tensor([[[1, 0], [0, 1]],
-#                       [[0, 1], [1, 0]]]).float() / 2
-
-kernel = torch.tensor([[[1, 1], [1, 0]],
-                      [[1, 1], [0, 1]],
-                      [[1, 0], [1, 1]],
-                      [[0, 1], [1, 1]]]).float() / 3
-
+kernel = torch.tensor([[[[1, 0], [0, 1]], [[0, 1], [1, 0]]], 
+                       [[[0, 1], [1, 0]], [[1, 0], [0, 1]]]]).float() / 4   
 if __name__ == '__main__':
-    for i in range(kernel.shape[0]):
-        print(kernel[i])
+    print(kernel)
+
+

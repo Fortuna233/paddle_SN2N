@@ -30,7 +30,7 @@ class myDataset(Dataset):
     def __init__(self, file_list, is_train):
         self.file_list = file_list
         self.is_train = is_train
-        self.train_augs = T.Compose([T.RandomHorizontalFlip(p=0.5), T.RandomVerticalFlip(p=0.5)])
+        # self.train_augs = T.Compose([T.RandomHorizontalFlip(p=0.5), T.RandomVerticalFlip(p=0.5)])
 
     def __len__(self):
         return len(self.file_list)
@@ -43,7 +43,8 @@ class myDataset(Dataset):
         parts = os.path.splitext(filename)[0].split("_")
         chunk_positions = np.array(parts, dtype=int)[1:]  # 跳过map_index，取x,y,z坐标
         if self.is_train:
-            return self.train_augs(torch.from_numpy(data)), chunk_positions
+            # return self.train_augs(torch.from_numpy(data)), chunk_positions
+            return torch.from_numpy(data), chunk_positions
         return torch.from_numpy(data), chunk_positions
         
 
@@ -98,7 +99,7 @@ def train(rank, world_size, model, kernel, paramsFolder, datasetsFolder, logsFol
     vali_iter = prepare_dataloader(valiSet, batch_size=batch_size, is_train=False)
 
     trainer = torch.optim.AdamW(model.parameters(), lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-2, amsgrad=False)
-    scheduler = OneCycleLR(trainer, max_lr=1e-3, total_steps=batch_size*len(train_iter)*(num_epochs - current_epochs), pct_start=0.3, anneal_strategy='cos', cycle_momentum=True, base_momentum=0.85, max_momentum=0.95,div_factor=25,final_div_factor=1e5)
+    scheduler = OneCycleLR(trainer, max_lr=1e-3, total_steps=len(train_iter)*(num_epochs - current_epochs), pct_start=0.3, anneal_strategy='cos', cycle_momentum=True, base_momentum=0.85, max_momentum=0.95,div_factor=25,final_div_factor=1e5)
     scaler = GradScaler()
 
     train_Loss = []
@@ -110,7 +111,8 @@ def train(rank, world_size, model, kernel, paramsFolder, datasetsFolder, logsFol
     if rank==0:
         print(local_now)
     for epoch in range(current_epochs, num_epochs):
-        gamma =  2.0 - 2.0 / num_epochs * epoch
+        # gamma =  2.0 - 2.0 / num_epochs * epoch
+        gamma =  1.0
         train_iter.sampler.set_epoch(epoch)
         train_loss = 0
         vali_loss = 0
@@ -124,7 +126,7 @@ def train(rank, world_size, model, kernel, paramsFolder, datasetsFolder, logsFol
                 Y = model(X)
                 X = X.reshape(batch_size, channels, *spatial_dims)
                 Y = Y.reshape(batch_size, channels, *spatial_dims)
-                l = loss_channels(X, Y, gamma)
+                l = loss_channels(X, Y, gamma=1.0)
                 train_loss += l.item()
                 loss_batch += l.item() / accumulation_steps
                 del X, Y
@@ -135,7 +137,6 @@ def train(rank, world_size, model, kernel, paramsFolder, datasetsFolder, logsFol
             if (i + 1) % accumulation_steps == 0:
                 scaler.step(trainer)
                 scaler.update()
-                
                 trainer.zero_grad()
                 Time = time.time() - starttime
                 log_msg = f"[epoch: {epoch}] [processing: {i + 1}/{len(train_iter)}] [loss: {loss_batch}] [lr: {trainer.param_groups[0]['lr']}] [Time: {Time:.2f}s]"
@@ -160,7 +161,7 @@ def train(rank, world_size, model, kernel, paramsFolder, datasetsFolder, logsFol
         vali_Loss.append(vali_loss / len(vali_iter))
 
         
-        log_msg = f"[epoch: {epoch}] [processing: {i + 1}/{len(train_iter)}] [train_loss: {loss_batch}] [vali_loss: {vali_Loss[-1]}] [lr: {trainer.param_groups[0]['lr']}] [Time: {Time:.2f}s]"
+        log_msg = f"[epoch: {epoch}] [processing: {i + 1}/{len(train_iter)}] [train_loss: {train_Loss[-1]}] [vali_loss: {vali_Loss[-1]}] [lr: {trainer.param_groups[0]['lr']}] [Time: {Time:.2f}s]"
         if rank == 0:
             print(log_msg)
             print(f"checkPoint_{epoch}")
@@ -175,6 +176,7 @@ def train(rank, world_size, model, kernel, paramsFolder, datasetsFolder, logsFol
         train_Loss = np.array(train_Loss)
         vali_Loss = np.array(vali_Loss)
         gammas = np.linspace(2, 0, num_epochs)
+        # 必须得完整训练才能做图。编写绘图函数
         plt.plot(range(num_epochs), train_Loss, label='train loss')
         plt.plot(range(num_epochs), vali_Loss, label='vali loss')
         plt.plot(range(num_epochs), gammas, label='gamma')
@@ -189,7 +191,7 @@ def train(rank, world_size, model, kernel, paramsFolder, datasetsFolder, logsFol
 
 
 # # input raw_map and output prediction file
-def predict(model, raw_map, box_size, stride, paramsFolder):
+def predict(model, raw_map, box_size, stride, paramsFolder, mode='3d'):
     total_params = sum(p.numel() for p in model.parameters())
     print(f"num_parameters: {total_params}")
 
@@ -209,37 +211,51 @@ def predict(model, raw_map, box_size, stride, paramsFolder):
         print(f'load {paramsFolder}/checkPoint_{current_epoch - 1}')
     else:
         model.apply(init_weights)
+        print(f'no params found, randomly init model')
     
     
     raw_map_mean = np.mean(raw_map)
     map_shape = raw_map.shape
 
 
-    chunk_coords_generator = generate_chunk_coords(raw_map.shape, box_size, stride)
+    chunk_coords_generator = generate_chunk_coords(map_shape, box_size, stride, mode=mode)
     padded_map = np.full((map_shape[0] + 2 * box_size, map_shape[1] + 2 * box_size, map_shape[2] + 2 * box_size), 0.0, dtype=np.float32)
     padded_map[box_size : box_size + map_shape[0], box_size : box_size + map_shape[1], box_size : box_size + map_shape[2]] = raw_map
     del raw_map
-    
-    num_chunks = ((map_shape[0] + box_size) // stride) * ((map_shape[1] + box_size) // stride) * ((map_shape[2] + box_size) // stride)
+
+
     map = np.zeros(tuple(dim + 2 * box_size for dim in map_shape), dtype=np.float32)
     denominator = np.zeros_like(map)
-
+    model.eval()
     with torch.no_grad():
         for i, coords in enumerate(chunk_coords_generator):
-            cur_x, cur_y, cur_z = coords
-            X = padded_map[cur_x:cur_x + box_size, cur_y:cur_y + box_size, cur_z:cur_z + box_size]
-            if np.max(X) >= raw_map_mean / 2:
+            cur_z, cur_x, cur_y = coords
+            if mode == '2d':
+                X = padded_map[cur_z, cur_x:cur_x + box_size, cur_y:cur_y + box_size]
+            elif mode == '3d':
+                X = padded_map[cur_z:cur_z + box_size, cur_x:cur_x + box_size, cur_y:cur_y + box_size]
+
+            if np.mean(X) >= raw_map_mean / 2:
+                X_shape = X.shape
                 X = torch.from_numpy(X)
-                X = X.reshape(-1, 1, *X.shape)
-                X = model(X.to(device=devices[0])).reshape(box_size, box_size, box_size).cpu().numpy()
+                X = X.reshape(-1, 1, *X_shape)
+                X = model(X.to(device=devices[0])).reshape(*X_shape).cpu().numpy()
             else:
                 X = 0
-            
-            map[cur_x:cur_x + box_size,
-                cur_y:cur_y + box_size,
-                cur_z:cur_z + box_size] += X
-            denominator[cur_x:cur_x + box_size,
-                cur_y:cur_y + box_size,
-                cur_z:cur_z + box_size] += 1
-            print(f"processing: {i}/{num_chunks}")
+
+            if mode == '3d':
+                map[cur_z:cur_z + box_size,
+                    cur_x:cur_x + box_size,
+                    cur_y:cur_y + box_size] += X
+                denominator[cur_z:cur_z + box_size,
+                    cur_x:cur_x + box_size,
+                    cur_y:cur_y + box_size] += 1
+            elif mode == '2d':
+                map[cur_z,
+                    cur_x:cur_x + box_size,
+                    cur_y:cur_y + box_size] += X
+                denominator[cur_z,
+                    cur_x:cur_x + box_size,
+                    cur_y:cur_y + box_size] += 1
+            print(f"processing: {i}")
     return (map / denominator.clip(min=1))[box_size : map_shape[0] + box_size, box_size : map_shape[1] + box_size, box_size : map_shape[2] + box_size]

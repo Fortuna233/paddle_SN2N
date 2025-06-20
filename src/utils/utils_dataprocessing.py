@@ -27,12 +27,12 @@ def get_all_files(directory):
 def normalize(map_data, minPercent=0, maxPercent=99.999, mode='3d'):
     map_data = np.array(map_data)
     
-    if mode.lower() == '3d':
+    if mode == '3d':
         min_val = np.percentile(map_data, minPercent)
         max_val = np.percentile(map_data, maxPercent)
         map_data = np.clip(map_data, min_val, max_val)
         normalized_data = (map_data - min_val) / (max_val - min_val)
-    elif mode.lower() == '2d':
+    elif mode == '2d':
         if map_data.ndim == 2:
             map_data = map_data.reshape(-1, map_data.shape[0], map_data.shape[1])
         normalized_data = np.zeros_like(map_data, dtype=np.float32)
@@ -49,16 +49,15 @@ def normalize(map_data, minPercent=0, maxPercent=99.999, mode='3d'):
 
 
 def generate_chunk_coords(map_shape, box_size, stride, mode='3d'):
-    start_point = box_size - stride
     if mode == '3d':
-        z_coords = np.arange(start_point, map_shape[0] + box_size, stride)
-        x_coords = np.arange(start_point, map_shape[1] + box_size, stride)
-        y_coords = np.arange(start_point, map_shape[2] + box_size, stride)
+        z_coords = np.arange(stride, map_shape[0] + box_size, stride)
+        x_coords = np.arange(stride, map_shape[1] + box_size, stride)
+        y_coords = np.arange(stride, map_shape[2] + box_size, stride)
         chunk_coords_generator = product(z_coords, x_coords, y_coords)
     elif mode == '2d':
-        z_coords = np.arange(box_size - 1, map_shape[0] + box_size, 1)
-        x_coords = np.arange(start_point, map_shape[1] + box_size, stride)
-        y_coords = np.arange(start_point, map_shape[2] + box_size, stride)
+        z_coords = np.arange(box_size, map_shape[0] + box_size, 1)
+        x_coords = np.arange(stride, map_shape[1] + box_size, stride)
+        y_coords = np.arange(stride, map_shape[2] + box_size, stride)
         chunk_coords_generator = product(z_coords, x_coords, y_coords)
     return chunk_coords_generator
 
@@ -96,6 +95,7 @@ def split_and_save_tensor(map_file, datasetsFolder, map_index, minPercent=0, max
 
     map_data = normalize(map_data, minPercent=minPercent, maxPercent=maxPercent, mode=mode)
     map_shape = map_data.shape
+    print(f"map_shape: {map_shape}")
     if len(map_shape) == 2:
         map_data = map_data.reshape(-1, *map_shape)
     padded_map = np.full((map_shape[0] + 2 * box_size, map_shape[1] + 2 * box_size, map_shape[2] + 2 * box_size), 0.0, dtype=np.float32)
@@ -142,7 +142,6 @@ def resample(batch_chunks, kernel):
     kernel = kernel.view(out_channels, 1, *spatial_dims)
     batch_size, *chunks_shape = batch_chunks.shape
     batch_chunks = batch_chunks.view(batch_size, 1, *chunks_shape)
-    
     if len(spatial_dims) == 3:
         conv_layer = nn.Conv3d(in_channels=1, out_channels=out_channels, kernel_size=2, stride=2, padding=0, bias=False)
         conv_layer.weight.data = kernel

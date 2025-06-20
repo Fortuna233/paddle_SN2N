@@ -5,8 +5,8 @@ num_epochs = 50
 batch_size = 64
 lr = 1e-4
 vali_ratio = 0.1
-box_size = 64
-stride = 32
+box_size = 128
+stride = 64
 accumulations_steps = 1
 
 
@@ -35,7 +35,3 @@ kernel = torch.tensor([[[1, 1], [1, 0]],
                       [[1, 1], [0, 1]],
                       [[1, 0], [1, 1]],
                       [[0, 1], [1, 1]]]).float() / 3
-
-if __name__ == '__main__':
-    for i in range(kernel.shape[0]):
-        print(kernel[i])

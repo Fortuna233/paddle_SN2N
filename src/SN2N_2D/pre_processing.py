@@ -1,6 +1,6 @@
 import os
 from src.utils.utils_dataprocessing import get_all_files, split_and_save_tensor
-from src.constants import rawdataFolder, datasetsFolder, box_size, stride
+from src.SN2N_2D.constants_2d import rawdataFolder, datasetsFolder, box_size, stride
 
 
 raw_map_list = get_all_files(rawdataFolder)

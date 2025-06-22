@@ -7,7 +7,7 @@ import numpy as np
 import torch.multiprocessing as mp
 from src.utils.utils_dataprocessing import get_all_files, combine_tensors_to_gif, normalize
 from src.utils.utils_train_predict import predict
-from src.constants import rawdataFolder, paramsFolder, resultFolder, box_size, stride
+from src.SN2N_2D.constants_2d import rawdataFolder, paramsFolder, resultFolder, box_size, stride_inference
 from src.models.scunet import SCUNet
 from monai.networks.nets import UNet
 
@@ -31,8 +31,8 @@ if __name__ == "__main__":
         if len(raw_map.shape) == 2:
             raw_map = raw_map.reshape(-1, *raw_map.shape)
 
-        denoised_map = predict(model, raw_map, box_size=box_size, stride=64, paramsFolder=paramsFolder, mode='2d')
-        denoised_map = normalize(denoised_map, mode='2d')
+        denoised_map = predict(model, raw_map, box_size=box_size, stride=stride_inference, paramsFolder=paramsFolder, mode='2d')
+        denoised_map = normalize(denoised_map, minPercent=0, maxPercent=99.999, mode='2d')
         tifffile.imwrite(f'{resultFolder}/{map_index}_denoised.tif', denoised_map, imagej=True, metadata={'axes': 'ZYX'}, compression='zlib')
 
         combine_tensors_to_gif(

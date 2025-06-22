@@ -58,7 +58,7 @@ def get_dataset(save_path, batch_size):
     return train_iter, vali_iter
 
 
-def loss_channels(X, Y, gamma=2, beta=0.5):
+def loss_channels(X, Y, gamma=2, beta=1):
     def L0loss(pred, target, gamma, eps=1e-8):
         diff = torch.abs(pred - target)
         loss = (diff + eps) ** gamma

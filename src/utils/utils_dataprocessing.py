@@ -68,8 +68,8 @@ def process_chunk(padded_map, datasetsFolder, chunk_coords, box_size, map_index,
         next_chunk = padded_map[cur_z:cur_z + box_size, cur_x:cur_x + box_size, cur_y:cur_y + box_size].numpy()
     elif mode == '2d':
         next_chunk = padded_map[cur_z, cur_x:cur_x + box_size, cur_y:cur_y + box_size].numpy()
-    if np.mean(next_chunk) < raw_map_mean / 2:
-        print(f"too lower mean intensity")
+    if np.mean(next_chunk) > 2 * raw_map_mean:
+        print(f"too high mean intensity")
         return None
 
     filepath = os.path.join(datasetsFolder, f'{map_index}_{cur_z}_{cur_x}_{cur_y}.npz')
@@ -124,26 +124,7 @@ def split_and_save_tensor(map_file, datasetsFolder, map_index, minPercent=0, max
     return map_shape
 
 
-# def fourier_interpolate(tensor, scale_factor=2.0):
-#     dim = tuple(range(2, tensor.ndim))
-#     tensor_fft = fft.rfftn(tensor, dim=dim)
-#     tensor_shape = tensor.shape
-#     tensor_shape[2:] *= scale_factor
-    
-#     tensor_fft_padded = torch.zeros(
-#         tuple(tensor_shape),
-#         dtype=tensor_fft.dtype,
-#         device=tensor_fft.device
-#     )
-#     starts = (tensor_shape[2:] - tensor.shape[2:]) // 2
-    
-#     tensor_fft_padded[:, :, starts:starts+tensor.shape[2:]] = tensor_fft
-#     tensor_interpolated = fft.irfftn(tensor_fft_padded, s=tuple(tensor_shape[2:]), dim=dim)
-#     return tensor_interpolated
-
-# interpolate first and resample
-# can process both 2d and 3d tensors
-def resample(batch_chunks, kernel):
+def resample(batch_chunks, kernel, interpolate_mode='fourier'):
     out_channels, *spatial_dims = kernel.shape
     kernel = kernel.view(out_channels, 1, *spatial_dims)
     batch_size, *chunks_shape = batch_chunks.shape
@@ -152,67 +133,163 @@ def resample(batch_chunks, kernel):
         conv_layer = nn.Conv3d(in_channels=1, out_channels=out_channels, kernel_size=2, stride=2, padding=0, bias=False)
         conv_layer.weight.data = kernel
         batch_chunks = conv_layer(batch_chunks)
-        batch_chunks = torch.nn.functional.interpolate(batch_chunks, scale_factor=2, mode='trilinear')
+        if interpolate_mode == 'fourier':
+            batch_chunks = fourier_interpolate(batch_chunks)
+        else:
+            batch_chunks = torch.nn.functional.interpolate(batch_chunks, scale_factor=2, mode='trilinear')
     elif len(spatial_dims) == 2:
         conv_layer = nn.Conv2d(in_channels=1, out_channels=out_channels, kernel_size=2, stride=2, padding=0, bias=False)
         conv_layer.weight.data = kernel
         batch_chunks = conv_layer(batch_chunks)
-        batch_chunks = torch.nn.functional.interpolate(batch_chunks, scale_factor=2, mode='bilinear')
+        if interpolate_mode == 'fourier':
+            batch_chunks = fourier_interpolate(batch_chunks)
+        else:
+            batch_chunks = torch.nn.functional.interpolate(batch_chunks, scale_factor=2, mode='bilinear')
     return batch_chunks
 
 
-def combine_tensors_to_gif(
-    tensors: Dict[str, np.ndarray],
-    output_path: str = "combined_tensors.gif",
-    fps: int = 2,
-    cmap: str = "viridis",
-    figsize: tuple = (12, 8),
-    dpi: int = 100,
-    show_colorbar: bool = True,
-    vmin: Optional[float] = None,
-    vmax: Optional[float] = None
-) -> None:
-
-    # Check all tensors have the same depth
-    depths = [tensor.shape[0] for tensor in tensors.values()]   
-    depth = max(depths)
+def fourier_interpolate(image: torch.Tensor, factor: int = 2) -> torch.Tensor:
+    """
+    Upsample image or volumetric data using Fourier interpolation
     
-    # Create output directory if it doesn't exist
-    output_dir = os.path.dirname(output_path)
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
+    Args:
+        image: Input tensor, supports 4D (B, C, H, W) 2D images or 5D (B, C, D, H, W) 3D volumes
+        factor: Upsampling factor, default is 2
     
-    # Generate frames for GIF
-    frames = []
+    Returns:
+        Upsampled tensor
+    """
+    # Check input dimensions
+    if image.dim() not in [4, 5]:
+        raise ValueError("Input tensor must be 4D (B, C, H, W) or 5D (B, C, D, H, W)")
     
-    for i in range(depth):
-        # Create figure and axes
-        fig, axes = plt.subplots(1, len(tensors), figsize=figsize, dpi=dpi, sharey=True)
-        if len(tensors) == 1:
-            axes = [axes]  # Ensure axes is always a list
-        
-        # Plot each tensor's current layer
-        ims = []
-        for j, (name, tensor) in enumerate(tensors.items()):
-            im = axes[j].imshow(tensor[i % tensor.shape[0]], cmap=cmap, vmin=vmin, vmax=vmax)
-            ims.append(im)
-            axes[j].set_title(f"{name} - Layer {i % tensor.shape[0]}")
-        
-        # Add colorbar if specified
-        if show_colorbar:
-            fig.subplots_adjust(right=0.9)
-            cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
-            fig.colorbar(ims[0], cax=cbar_ax)
-        
-        # Render figure to numpy array
-        fig.canvas.draw()
-        frame = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-        frame = frame.reshape(fig.canvas.get_width_height()[::-1] + (3,))
-        frames.append(frame)
-        
-        # Close figure to free memory
-        plt.close(fig)
+    is_3d = (image.dim() == 5)
+    batch_size, channels = image.shape[:2]
     
-    # Save frames as GIF
-    imageio.mimsave(output_path, frames, fps=fps, loop=0)
-    print(f"GIF saved to: {output_path}")
+    # Calculate target dimensions
+    if is_3d:
+        depth, height, width = image.shape[2:]
+        target_depth = depth * factor
+        target_height = height * factor
+        target_width = width * factor
+    else:
+        height, width = image.shape[2:]
+        target_height = height * factor
+        target_width = width * factor
+    
+    # Initialize output tensor
+    if is_3d:
+        output_shape = (batch_size, channels, target_depth, target_height, target_width)
+    else:
+        output_shape = (batch_size, channels, target_height, target_width)
+        
+    upsampled_images = torch.zeros(output_shape, dtype=image.dtype, device=image.device)
+    
+    # Process each sample and channel
+    for b in range(batch_size):
+        for c in range(channels):
+            if is_3d:
+                img = image[b, c]  # [D, H, W]
+                # Symmetric padding
+                pad_d = depth // 2
+                pad_h = height // 2
+                pad_w = width // 2
+                img_padded = torch.nn.functional.pad(
+                    img.unsqueeze(0).unsqueeze(0),  # Add batch and channel dimensions
+                    (pad_w, pad_w, pad_h, pad_h, pad_d, pad_d), 
+                    mode='reflect'
+                ).squeeze(0).squeeze(0)  # Remove added dimensions
+                
+                # 3D Fourier transform
+                img_fft = torch.fft.fftn(img_padded, dim=(0, 1, 2))
+                
+                # Frequency domain zero-padding
+                fft_d, fft_h, fft_w = img_fft.shape
+                new_fft_d = fft_d * factor
+                new_fft_h = fft_h * factor
+                new_fft_w = fft_w * factor
+                
+                fft_padded = torch.zeros((new_fft_d, new_fft_h, new_fft_w), 
+                                        dtype=img_fft.dtype, device=img_fft.device)
+                
+                # Place original frequency components
+                d_half, h_half, w_half = fft_d // 2, fft_h // 2, fft_w // 2
+                
+                # Copy 8 quadrants (3D case)
+                fft_padded[:d_half, :h_half, :w_half] = img_fft[:d_half, :h_half, :w_half]
+                fft_padded[:d_half, :h_half, -w_half:] = img_fft[:d_half, :h_half, -w_half:]
+                fft_padded[:d_half, -h_half:, :w_half] = img_fft[:d_half, -h_half:, :w_half]
+                fft_padded[:d_half, -h_half:, -w_half:] = img_fft[:d_half, -h_half:, -w_half:]
+                fft_padded[-d_half:, :h_half, :w_half] = img_fft[-d_half:, :h_half, :w_half]
+                fft_padded[-d_half:, :h_half, -w_half:] = img_fft[-d_half:, :h_half, -w_half:]
+                fft_padded[-d_half:, -h_half:, :w_half] = img_fft[-d_half:, -h_half:, :w_half]
+                fft_padded[-d_half:, -h_half:, -w_half:] = img_fft[-d_half:, -h_half:, -w_half:]
+                
+                # Inverse 3D Fourier transform
+                img_ifft = torch.fft.ifftn(fft_padded, dim=(0, 1, 2))
+                
+                # Take real part and adjust scale
+                img_real = img_ifft.real
+                
+                # Crop to target size
+                start_d = (new_fft_d - target_depth) // 2
+                start_h = (new_fft_h - target_height) // 2
+                start_w = (new_fft_w - target_width) // 2
+                
+                img_cropped = img_real[
+                    start_d:start_d+target_depth,
+                    start_h:start_h+target_height,
+                    start_w:start_w+target_width
+                ]
+                
+                upsampled_images[b, c] = img_cropped / factor**3  # 3D normalization
+            else:
+                # 2D processing logic (similar to original code but handles channels)
+                img = image[b, c]  # [H, W]
+                
+                # Symmetric padding
+                pad_h = height // 2
+                pad_w = width // 2
+                img_padded = torch.nn.functional.pad(
+                    img.unsqueeze(0).unsqueeze(0),  # Add batch and channel dimensions
+                    (pad_w, pad_w, pad_h, pad_h), 
+                    mode='reflect'
+                ).squeeze(0).squeeze(0)  # Remove added dimensions
+                
+                # 2D Fourier transform
+                img_fft = torch.fft.fft2(img_padded)
+                
+                # Frequency domain zero-padding
+                fft_h, fft_w = img_fft.shape
+                new_fft_h = fft_h * factor
+                new_fft_w = fft_w * factor
+                
+                fft_padded = torch.zeros((new_fft_h, new_fft_w), 
+                                        dtype=img_fft.dtype, device=img_fft.device)
+                
+                # Place original frequency components
+                h_half, w_half = fft_h // 2, fft_w // 2
+                
+                fft_padded[:h_half, :w_half] = img_fft[:h_half, :w_half]
+                fft_padded[:h_half, -w_half:] = img_fft[:h_half, -w_half:]
+                fft_padded[-h_half:, :w_half] = img_fft[-h_half:, :w_half]
+                fft_padded[-h_half:, -w_half:] = img_fft[-h_half:, -w_half:]
+                
+                # Inverse 2D Fourier transform
+                img_ifft = torch.fft.ifft2(fft_padded)
+                
+                # Take real part and adjust scale
+                img_real = img_ifft.real
+                
+                # Crop to target size
+                start_h = (new_fft_h - target_height) // 2
+                start_w = (new_fft_w - target_width) // 2
+                
+                img_cropped = img_real[
+                    start_h:start_h+target_height,
+                    start_w:start_w+target_width
+                ]
+                
+                upsampled_images[b, c] = img_cropped / factor**2  # 2D normalization
+    
+    return upsampled_images

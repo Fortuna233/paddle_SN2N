@@ -58,15 +58,14 @@ def get_dataset(save_path, batch_size):
     return train_iter, vali_iter
 
 
-def loss_channels(X, Y, gamma=2, beta=1):
-    def L0loss(pred, target, gamma, eps=1e-8):
-        diff = torch.abs(pred - target)
-        loss = (diff + eps) ** gamma
-        return loss.mean() 
+def loss_channels(X, Y, beta=1):
+    L0loss = torch.nn.SmoothL1Loss(reduction='mean')
     num_channels = X.shape[1]
     i_indices, j_indices = torch.triu_indices(num_channels, num_channels, offset=1)
-    l_xy = L0loss(X[:, i_indices].reshape(-1, *X.shape[2:]), Y[:, j_indices].reshape(-1, *Y.shape[2:]), gamma) + L0loss(X[:, j_indices].reshape(-1, *X.shape[2:]), Y[:, i_indices].reshape(-1, *Y.shape[2:]), gamma)
-    l_yy = L0loss(Y[:, i_indices].reshape(-1, *Y.shape[2:]), Y[:, j_indices].reshape(-1, *Y.shape[2:]), gamma)
+    # l_xy = L0loss(X[:, i_indices].reshape(-1, *X.shape[2:]), Y[:, j_indices].reshape(-1, *Y.shape[2:]), gamma) + L0loss(X[:, j_indices].reshape(-1, *X.shape[2:]), Y[:, i_indices].reshape(-1, *Y.shape[2:]), gamma)
+    # l_yy = L0loss(Y[:, i_indices].reshape(-1, *Y.shape[2:]), Y[:, j_indices].reshape(-1, *Y.shape[2:]), gamma)
+    l_xy = L0loss(X[:, i_indices], Y[:, j_indices]) + L0loss(X[:, j_indices], Y[:, i_indices])
+    l_yy = L0loss(Y[:, i_indices], Y[:, j_indices])
     return (l_xy + beta * l_yy) / (2 + beta)
 
 
@@ -78,7 +77,6 @@ def train(rank, world_size, model, kernel, paramsFolder, datasetsFolder, logsFol
         print(f"num_parameters: {total_params}")
     
     model = create_ddp_model(rank=rank, model=model)  
-    model = torch.compile(model)
     def init_weights(m):
         if type(m) == nn.Linear or type(m) == nn.Conv3d or type(m) == nn.Conv2d:  
             nn.init.xavier_uniform_(m.weight)
@@ -99,7 +97,7 @@ def train(rank, world_size, model, kernel, paramsFolder, datasetsFolder, logsFol
     vali_iter = prepare_dataloader(valiSet, batch_size=batch_size, is_train=False)
 
     trainer = torch.optim.AdamW(model.parameters(), lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-2, amsgrad=False)
-    scheduler = OneCycleLR(trainer, max_lr=1e-3, total_steps=len(train_iter)*(num_epochs - current_epochs), pct_start=0.3, anneal_strategy='cos', cycle_momentum=True, base_momentum=0.85, max_momentum=0.95,div_factor=25,final_div_factor=1e5)
+    scheduler = OneCycleLR(trainer, max_lr=1e-3, total_steps=int(len(train_iter)*(num_epochs - current_epochs)/accumulation_steps), pct_start=0.3, anneal_strategy='cos', cycle_momentum=True, base_momentum=0.85, max_momentum=0.95,div_factor=25,final_div_factor=1e5)
     scaler = GradScaler()
 
     train_Loss = []
@@ -132,11 +130,12 @@ def train(rank, world_size, model, kernel, paramsFolder, datasetsFolder, logsFol
                 del X, Y
             
             scaler.scale(l).backward()
-            scheduler.step()
+            
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             if (i + 1) % accumulation_steps == 0:
                 scaler.step(trainer)
                 scaler.update()
+                scheduler.step()
                 trainer.zero_grad()
                 Time = time.time() - starttime
                 log_msg = f"[epoch: {epoch}] [processing: {i + 1}/{len(train_iter)}] [loss: {loss_batch}] [lr: {trainer.param_groups[0]['lr']}] [Time: {Time:.2f}s]"
@@ -145,6 +144,7 @@ def train(rank, world_size, model, kernel, paramsFolder, datasetsFolder, logsFol
                     loss_batch = 0
                     with open(f"{logsFolder}/output_{local_now}.log", "a") as file:
                         file.write(log_msg + "\n")
+            
         epoch_loss = train_loss / len(train_iter)
         train_Loss.append(epoch_loss)
 
@@ -172,21 +172,7 @@ def train(rank, world_size, model, kernel, paramsFolder, datasetsFolder, logsFol
                 torch.save(model.module.state_dict(), f"{paramsFolder}/checkPoint_{epoch}")
             else:
                 torch.save(model.state_dict(), f"{paramsFolder}/checkPoint_{epoch}")
-    if rank == 0:
-        train_Loss = np.array(train_Loss)
-        vali_Loss = np.array(vali_Loss)
-        gammas = np.linspace(2, 0, num_epochs)
-        # 必须得完整训练才能做图。编写绘图函数
-        plt.plot(range(num_epochs), train_Loss, label='train loss')
-        plt.plot(range(num_epochs), vali_Loss, label='vali loss')
-        plt.plot(range(num_epochs), gammas, label='gamma')
-        plt.xlabel('Epoch')
-        plt.ylabel('log of loss')
-        plt.legend(loc='upper right')
-        plt.yscale('log')
-        plt.title('Training Loss')
-        plt.savefig(f'{logsFolder}/training_loss.png')  # 保存图像
-        plt.show()
+
     cleanup()
 
 
@@ -196,24 +182,6 @@ def predict(model, raw_map, box_size, stride, paramsFolder, mode='3d'):
     print(f"num_parameters: {total_params}")
 
     devices = try_all_gpus()
-    model = model.to(devices[0])
-    model = torch.compile(model)
-    def init_weights(m):
-        if type(m) == nn.Linear or type(m) == nn.Conv3d or type(m) == nn.Conv2d:  
-            nn.init.xavier_uniform_(m.weight)
-
-    current_epoch = len(get_all_files(paramsFolder))
-    if current_epoch != 0:
-        state_dict = torch.load(f'{paramsFolder}/checkPoint_{current_epoch - 1}')
-        new_state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-        model.load_state_dict(new_state_dict, strict=False)
-        # model.load_state_dict(torch.load(f'{paramsFolder}/checkPoint_{current_epoch - 1}'))
-        print(f'load {paramsFolder}/checkPoint_{current_epoch - 1}')
-    else:
-        model.apply(init_weights)
-        print(f'no params found, randomly init model')
-    
-    
     raw_map_mean = np.mean(raw_map)
     map_shape = raw_map.shape
 
@@ -235,22 +203,27 @@ def predict(model, raw_map, box_size, stride, paramsFolder, mode='3d'):
             elif mode == '3d':
                 X = padded_map[cur_z:cur_z + box_size, cur_x:cur_x + box_size, cur_y:cur_y + box_size]
 
-            if np.mean(X) >= raw_map_mean / 2:
-                X_shape = X.shape
-                X = torch.from_numpy(X)
-                X = X.reshape(-1, 1, *X_shape)
-                X = model(X.to(device=devices[0])).reshape(*X_shape).cpu().numpy()
-            else:
-                X = 0
+            # if np.mean(X) < 2 * raw_map_mean:
+            #     X_shape = X.shape
+            #     X = torch.from_numpy(X)
+            #     X = X.reshape(-1, 1, *X_shape)
+            #     X = model(X.to(device=devices[0])).reshape(*X_shape).cpu().numpy()
+            # else:
+            #     X = 1
+            
+            X_shape = X.shape
+            X = torch.from_numpy(X)
+            X = X.reshape(-1, 1, *X_shape)
+            X = model(X.to(device=devices[0])).reshape(*X_shape).cpu().numpy()
 
-            if mode == '3d':
+            if mode == '3d' and np.any(X != 1):
                 map[cur_z:cur_z + box_size,
                     cur_x:cur_x + box_size,
                     cur_y:cur_y + box_size] += X
                 denominator[cur_z:cur_z + box_size,
                     cur_x:cur_x + box_size,
                     cur_y:cur_y + box_size] += 1
-            elif mode == '2d':
+            elif mode == '2d' and np.any(X != 1):
                 map[cur_z,
                     cur_x:cur_x + box_size,
                     cur_y:cur_y + box_size] += X
@@ -259,3 +232,5 @@ def predict(model, raw_map, box_size, stride, paramsFolder, mode='3d'):
                     cur_y:cur_y + box_size] += 1
             print(f"processing: {i}")
     return (map / denominator.clip(min=1))[box_size : map_shape[0] + box_size, box_size : map_shape[1] + box_size, box_size : map_shape[2] + box_size]
+
+

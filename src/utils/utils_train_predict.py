@@ -1,6 +1,6 @@
-from email.policy import strict
 import os
 import time
+import tifffile
 from datetime import datetime
 
 import numpy as np
@@ -18,7 +18,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import OneCycleLR
 
 from src.utils.utils_ddp import *
-from src.utils.utils_dataprocessing import get_all_files, resample, generate_chunk_coords
+from src.utils.utils_dataprocessing import get_all_files, resample, normalize
 
 
 def try_all_gpus():
@@ -59,13 +59,11 @@ def get_dataset(save_path, batch_size):
 
 
 def loss_channels(X, Y, beta=1):
-    L0loss = torch.nn.SmoothL1Loss(reduction='mean')
+    L1loss = torch.nn.SmoothL1Loss(reduction='mean')
     num_channels = X.shape[1]
     i_indices, j_indices = torch.triu_indices(num_channels, num_channels, offset=1)
-    # l_xy = L0loss(X[:, i_indices].reshape(-1, *X.shape[2:]), Y[:, j_indices].reshape(-1, *Y.shape[2:]), gamma) + L0loss(X[:, j_indices].reshape(-1, *X.shape[2:]), Y[:, i_indices].reshape(-1, *Y.shape[2:]), gamma)
-    # l_yy = L0loss(Y[:, i_indices].reshape(-1, *Y.shape[2:]), Y[:, j_indices].reshape(-1, *Y.shape[2:]), gamma)
-    l_xy = L0loss(X[:, i_indices], Y[:, j_indices]) + L0loss(X[:, j_indices], Y[:, i_indices])
-    l_yy = L0loss(Y[:, i_indices], Y[:, j_indices])
+    l_xy = L1loss(X[:, i_indices], Y[:, j_indices]) + L1loss(X[:, j_indices], Y[:, i_indices])
+    l_yy = L1loss(Y[:, i_indices], Y[:, j_indices])
     return (l_xy + beta * l_yy) / (2 + beta)
 
 
@@ -109,8 +107,6 @@ def train(rank, world_size, model, kernel, paramsFolder, datasetsFolder, logsFol
     if rank==0:
         print(local_now)
     for epoch in range(current_epochs, num_epochs):
-        # gamma =  2.0 - 2.0 / num_epochs * epoch
-        gamma =  1.0
         train_iter.sampler.set_epoch(epoch)
         train_loss = 0
         vali_loss = 0
@@ -124,7 +120,7 @@ def train(rank, world_size, model, kernel, paramsFolder, datasetsFolder, logsFol
                 Y = model(X)
                 X = X.reshape(batch_size, channels, *spatial_dims)
                 Y = Y.reshape(batch_size, channels, *spatial_dims)
-                l = loss_channels(X, Y, gamma=1.0)
+                l = loss_channels(X, Y)
                 train_loss += l.item()
                 loss_batch += l.item() / accumulation_steps
                 del X, Y
@@ -156,7 +152,7 @@ def train(rank, world_size, model, kernel, paramsFolder, datasetsFolder, logsFol
                 Y = model(X)
                 X = X.reshape(batch_size, channels, *spatial_dims)
                 Y = Y.reshape(batch_size, channels, *spatial_dims)
-                l = loss_channels(X, Y, gamma)
+                l = loss_channels(X, Y)
                 vali_loss += l.item()
         vali_Loss.append(vali_loss / len(vali_iter))
 
@@ -168,69 +164,57 @@ def train(rank, world_size, model, kernel, paramsFolder, datasetsFolder, logsFol
             print("=================================================================================================================")
             with open(f"{logsFolder}/output_{local_now}.log", "a") as file:
                 file.write(log_msg + "\n")  
-            if isinstance(model, torch.nn.DataParallel):
-                torch.save(model.module.state_dict(), f"{paramsFolder}/checkPoint_{epoch}")
-            else:
-                torch.save(model.state_dict(), f"{paramsFolder}/checkPoint_{epoch}")
+            torch.save(model, f'{paramsFolder}/checkPoint_{epoch}.pth')
 
     cleanup()
 
 
 # # input raw_map and output prediction file
-def predict(model, raw_map, box_size, stride, paramsFolder, mode='3d'):
+def predict(rawdataFolder, paramsFolder, resultFolder, mode='2d'):
+    devices = try_all_gpus()
+
+    def init_weights(m):
+        if type(m) == torch.nn.Linear or type(m) == torch.nn.Conv3d or type(m) == torch.nn.Conv2d:  
+            torch.nn.init.xavier_uniform_(m.weight)
+    devices = try_all_gpus()
+    current_epoch = len(get_all_files(paramsFolder))
+    if current_epoch != 0:
+        checkPoint = torch.load(f'{paramsFolder}/checkPoint_{current_epoch - 1}.pth', weights_only=False)
+        model = checkPoint['model']
+        
+        print(f'load {paramsFolder}/checkPoint_{current_epoch - 1}')
+
     total_params = sum(p.numel() for p in model.parameters())
     print(f"num_parameters: {total_params}")
 
-    devices = try_all_gpus()
-    raw_map_mean = np.mean(raw_map)
-    map_shape = raw_map.shape
+    map_files = get_all_files(rawdataFolder)
+    for map_index, map_file in enumerate(map_files): 
+        print(f"processing: {map_index}")
+        raw_map = np.asarray(tifffile.imread(map_file))
+        raw_map = torch.from_numpy(normalize(raw_map, mode=mode))
+        model.eval()
+        with torch.no_grad():
+            predicted_map = model(raw_map.to(device=devices[0])).cpu().numpy()
+            raw_map = raw_map.cpu().numpy()
+        tifffile.imwrite(f'{resultFolder}/processed_maps/{map_index}_denoised.tif', predicted_map, imagej=True, metadata={'axes': 'ZYX'}, compression=None)
+        tifffile.imwrite(f'{resultFolder}/combined_maps/{map_index}_combined.tif', np.concatenate((raw_map, predicted_map), axis=1), imagej=True, metadata={'axes': 'ZYX'}, compression=None)
 
 
-    chunk_coords_generator = generate_chunk_coords(map_shape, box_size, stride, mode=mode)
-    padded_map = np.full((map_shape[0] + 2 * box_size, map_shape[1] + 2 * box_size, map_shape[2] + 2 * box_size), 0.0, dtype=np.float32)
-    padded_map[box_size : box_size + map_shape[0], box_size : box_size + map_shape[1], box_size : box_size + map_shape[2]] = raw_map
-    del raw_map
-
-
-    map = np.zeros(tuple(dim + 2 * box_size for dim in map_shape), dtype=np.float32)
-    denominator = np.zeros_like(map)
-    model.eval()
-    with torch.no_grad():
-        for i, coords in enumerate(chunk_coords_generator):
-            cur_z, cur_x, cur_y = coords
-            if mode == '2d':
-                X = padded_map[cur_z, cur_x:cur_x + box_size, cur_y:cur_y + box_size]
-            elif mode == '3d':
-                X = padded_map[cur_z:cur_z + box_size, cur_x:cur_x + box_size, cur_y:cur_y + box_size]
-
-            # if np.mean(X) < 2 * raw_map_mean:
-            #     X_shape = X.shape
-            #     X = torch.from_numpy(X)
-            #     X = X.reshape(-1, 1, *X_shape)
-            #     X = model(X.to(device=devices[0])).reshape(*X_shape).cpu().numpy()
-            # else:
-            #     X = 1
-            
-            X_shape = X.shape
-            X = torch.from_numpy(X)
-            X = X.reshape(-1, 1, *X_shape)
-            X = model(X.to(device=devices[0])).reshape(*X_shape).cpu().numpy()
-
-            if mode == '3d' and np.any(X != 1):
-                map[cur_z:cur_z + box_size,
-                    cur_x:cur_x + box_size,
-                    cur_y:cur_y + box_size] += X
-                denominator[cur_z:cur_z + box_size,
-                    cur_x:cur_x + box_size,
-                    cur_y:cur_y + box_size] += 1
-            elif mode == '2d' and np.any(X != 1):
-                map[cur_z,
-                    cur_x:cur_x + box_size,
-                    cur_y:cur_y + box_size] += X
-                denominator[cur_z,
-                    cur_x:cur_x + box_size,
-                    cur_y:cur_y + box_size] += 1
-            print(f"processing: {i}")
-    return (map / denominator.clip(min=1))[box_size : map_shape[0] + box_size, box_size : map_shape[1] + box_size, box_size : map_shape[2] + box_size]
+def save_checkpoint(model, optimizer, scheduler, cur_epoch, cur_step, path):
+    if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+        model_to_save = model.module
+    else:
+        model_to_save = model
+    
+    checkpoint = {
+        'model': model_to_save,           
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'cur_epoch': cur_epoch,
+        'cur_step': cur_step
+    }
+    
+    torch.save(checkpoint, path)
+    print(f"Checkpoint saved to {path}")
 
 

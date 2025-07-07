@@ -209,7 +209,7 @@ def plot_multiple_tensors(tensors: List[np.ndarray],
 
 
 if __name__ == "__main__":
-    log_file_path = '/home/tyche/paddle_SN2N/data/data_2d/logs/output_2025-06-24 14:20:41.293755.log'
+    log_file_path = '/home/tyche/paddle_SN2N/data/data_2d/logs/output_2025-06-27 10:28:46.808390.log'
     metrics = parse_log_file(log_file_path)
     for metric, values in metrics.items():
         print(f"{metric}: {values[:5]}... ({len(values)} values)")

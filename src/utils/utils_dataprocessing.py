@@ -7,9 +7,6 @@ from pathlib import Path
 from functools import partial
 from itertools import product
 from concurrent.futures import ProcessPoolExecutor, as_completed
-import imageio
-import matplotlib.pyplot as plt
-from typing import Dict, Optional
 
 import torch
 from torch import nn
@@ -62,16 +59,12 @@ def generate_chunk_coords(map_shape, box_size, stride, mode='3d'):
     return chunk_coords_generator
 
 
-def process_chunk(padded_map, datasetsFolder, chunk_coords, box_size, map_index, raw_map_mean, mode='3d'):
+def process_chunk(padded_map, datasetsFolder, chunk_coords, box_size, map_index, mode='3d'):
     cur_z, cur_x, cur_y = chunk_coords
     if mode == '3d':
         next_chunk = padded_map[cur_z:cur_z + box_size, cur_x:cur_x + box_size, cur_y:cur_y + box_size].numpy()
     elif mode == '2d':
         next_chunk = padded_map[cur_z, cur_x:cur_x + box_size, cur_y:cur_y + box_size].numpy()
-    if np.mean(next_chunk) > 2 * raw_map_mean:
-        print(f"too high mean intensity")
-        return None
-
     filepath = os.path.join(datasetsFolder, f'{map_index}_{cur_z}_{cur_x}_{cur_y}.npz')
     np.savez_compressed(filepath, next_chunk)
     return filepath, next_chunk.shape

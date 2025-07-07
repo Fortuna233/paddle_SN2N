@@ -9,7 +9,7 @@ batch_size = 128
 lr = 1e-4
 vali_ratio = 0.1
 box_size = 128
-stride = 64
+stride = 32
 stride_inference = 32
 accumulations_steps = 1
 

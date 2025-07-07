@@ -1,7 +1,7 @@
 import torch
 import torch.backends
 import torch.utils
-from src.utils.utils_train_predict import *
+from src.utils.utils_train_predict import train
 
 
 import torch.multiprocessing as mp

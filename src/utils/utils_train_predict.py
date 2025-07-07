@@ -82,7 +82,7 @@ def train(rank, world_size, model, kernel, paramsFolder, datasetsFolder, logsFol
     
     current_epochs = len(get_all_files(paramsFolder))
     if current_epochs != 0:
-        model.load_state_dict(torch.load(f'{paramsFolder}/checkPoint_{current_epochs - 1}'))
+        model.load_state_dict(torch.load(f'{paramsFolder}/checkPoint_{current_epochs - 1}.pth'))
     else:
         model.apply(init_weights)
 
@@ -165,14 +165,13 @@ def train(rank, world_size, model, kernel, paramsFolder, datasetsFolder, logsFol
             with open(f"{logsFolder}/output_{local_now}.log", "a") as file:
                 file.write(log_msg + "\n")  
             torch.save(model, f'{paramsFolder}/checkPoint_{epoch}.pth')
-
     cleanup()
 
 
 # # input raw_map and output prediction file
 def predict(rawdataFolder, paramsFolder, resultFolder, mode='2d'):
     devices = try_all_gpus()
-
+    
     def init_weights(m):
         if type(m) == torch.nn.Linear or type(m) == torch.nn.Conv3d or type(m) == torch.nn.Conv2d:  
             torch.nn.init.xavier_uniform_(m.weight)
@@ -200,7 +199,7 @@ def predict(rawdataFolder, paramsFolder, resultFolder, mode='2d'):
         tifffile.imwrite(f'{resultFolder}/combined_maps/{map_index}_combined.tif', np.concatenate((raw_map, predicted_map), axis=1), imagej=True, metadata={'axes': 'ZYX'}, compression=None)
 
 
-def save_checkpoint(model, optimizer, scheduler, cur_epoch, cur_step, path):
+def save_checkpoint(model, optimizer, scheduler, cur_epoch, path):
     if isinstance(model, torch.nn.parallel.DistributedDataParallel):
         model_to_save = model.module
     else:
@@ -211,7 +210,6 @@ def save_checkpoint(model, optimizer, scheduler, cur_epoch, cur_step, path):
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': scheduler.state_dict(),
         'cur_epoch': cur_epoch,
-        'cur_step': cur_step
     }
     
     torch.save(checkpoint, path)

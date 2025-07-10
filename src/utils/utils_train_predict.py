@@ -67,24 +67,32 @@ def loss_channels(X, Y, beta=1):
     return (l_xy + beta * l_yy) / (2 + beta)
 
 
-def train(rank, world_size, model, kernel, paramsFolder, datasetsFolder, logsFolder, num_epochs, batch_size, accumulation_steps):
+def train(rank, world_size, model, kernel, paramsFolder, datasetsFolder, logsFolder, num_epochs, batch_size, lr, accumulation_steps):
     setup(rank, world_size)
 
     if rank == 0:
         total_params = sum(p.numel() for p in model.parameters())
         print(f"num_parameters: {total_params}")
-    
-    model = create_ddp_model(rank=rank, model=model)  
     def init_weights(m):
-        if type(m) == nn.Linear or type(m) == nn.Conv3d or type(m) == nn.Conv2d:  
-            nn.init.xavier_uniform_(m.weight)
+        if type(m) == torch.nn.Linear or type(m) == torch.nn.Conv3d or type(m) == torch.nn.Conv2d:  
+            torch.nn.init.xavier_uniform_(m.weight)
     
     
-    current_epochs = len(get_all_files(paramsFolder))
-    if current_epochs != 0:
-        model.load_state_dict(torch.load(f'{paramsFolder}/checkPoint_{current_epochs - 1}.pth'))
+    current_epoch = len(get_all_files(paramsFolder))
+    print(f"current_epoch:{current_epoch}")
+    if current_epoch != 0:
+        state_dict = torch.load(f'{paramsFolder}/checkPoint_{current_epoch - 1}.pth')
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict)
+        if missing_keys:
+            print(f"missing_keys: {missing_keys}")
+        if unexpected_keys:
+            print(f"unused_keys: {unexpected_keys}")
+    
+        print(f'load {paramsFolder}/checkPoint_{current_epoch - 1}')
     else:
         model.apply(init_weights)
+        print(f'no params found, randomly init model')
+    model = create_ddp_model(rank=rank, model=model)  
 
     
     chunks_file = [os.path.join(datasetsFolder, f) for f in os.listdir(datasetsFolder) if f.endswith('.npz')]
@@ -94,8 +102,8 @@ def train(rank, world_size, model, kernel, paramsFolder, datasetsFolder, logsFol
     train_iter = prepare_dataloader(trainSet, batch_size=batch_size, is_train=True)
     vali_iter = prepare_dataloader(valiSet, batch_size=batch_size, is_train=False)
 
-    trainer = torch.optim.AdamW(model.parameters(), lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-2, amsgrad=False)
-    scheduler = OneCycleLR(trainer, max_lr=1e-3, total_steps=int(len(train_iter)*(num_epochs - current_epochs)/accumulation_steps), pct_start=0.3, anneal_strategy='cos', cycle_momentum=True, base_momentum=0.85, max_momentum=0.95,div_factor=25,final_div_factor=1e5)
+    trainer = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.999), eps=1e-8, weight_decay=1e-2, amsgrad=False)
+    scheduler = OneCycleLR(trainer, max_lr=lr, total_steps=int(len(train_iter)*(num_epochs - current_epoch)/accumulation_steps), pct_start=0.3, anneal_strategy='cos', cycle_momentum=True, base_momentum=0.85, max_momentum=0.95,div_factor=25,final_div_factor=1e5)
     scaler = GradScaler()
 
     train_Loss = []
@@ -106,7 +114,7 @@ def train(rank, world_size, model, kernel, paramsFolder, datasetsFolder, logsFol
     local_now = datetime.now()
     if rank==0:
         print(local_now)
-    for epoch in range(current_epochs, num_epochs):
+    for epoch in range(current_epoch, num_epochs):
         train_iter.sampler.set_epoch(epoch)
         train_loss = 0
         vali_loss = 0
@@ -164,55 +172,80 @@ def train(rank, world_size, model, kernel, paramsFolder, datasetsFolder, logsFol
             print("=================================================================================================================")
             with open(f"{logsFolder}/output_{local_now}.log", "a") as file:
                 file.write(log_msg + "\n")  
-            torch.save(model, f'{paramsFolder}/checkPoint_{epoch}.pth')
+            if isinstance(model, torch.nn.parallel.DistributedDataParallel) or isinstance(model, torch.nn.DataParallel):
+                torch.save(model.module.state_dict(), f"{paramsFolder}/checkPoint_{epoch}.pth")
+            else:
+                torch.save(model.state_dict(), f"{paramsFolder}/checkPoint_{epoch}.pth")
+
     cleanup()
 
 
 # # input raw_map and output prediction file
-def predict(rawdataFolder, paramsFolder, resultFolder, mode='2d'):
+def predict2d(model, rawdataFolder, paramsFolder, resultFolder):
     devices = try_all_gpus()
-    
     def init_weights(m):
         if type(m) == torch.nn.Linear or type(m) == torch.nn.Conv3d or type(m) == torch.nn.Conv2d:  
             torch.nn.init.xavier_uniform_(m.weight)
-    devices = try_all_gpus()
     current_epoch = len(get_all_files(paramsFolder))
+    print(f"current_epoch:{current_epoch}")
     if current_epoch != 0:
-        checkPoint = torch.load(f'{paramsFolder}/checkPoint_{current_epoch - 1}.pth', weights_only=False)
-        model = checkPoint['model']
-        
+        state_dict = torch.load(f'{paramsFolder}/checkPoint_{current_epoch - 1}.pth')
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict)
+        if missing_keys:
+            print(f"missing_keys: {missing_keys}")
+        if unexpected_keys:
+            print(f"unused_keys: {unexpected_keys}")
+    
         print(f'load {paramsFolder}/checkPoint_{current_epoch - 1}')
-
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"num_parameters: {total_params}")
-
+    else:
+        model.apply(init_weights)
+        print(f'no params found, randomly init model')
+    
+    model = model.to(devices[0])
     map_files = get_all_files(rawdataFolder)
-    for map_index, map_file in enumerate(map_files): 
-        print(f"processing: {map_index}")
-        raw_map = np.asarray(tifffile.imread(map_file))
-        raw_map = torch.from_numpy(normalize(raw_map, mode=mode))
-        model.eval()
-        with torch.no_grad():
+    model.eval()
+    with torch.no_grad():
+        for map_index, map_file in enumerate(map_files): 
+            print(f"processing: {map_file}")
+            raw_map = np.asarray(tifffile.imread(map_file))
+            normalized_map = torch.from_numpy(normalize(raw_map, mode=mode))
             predicted_map = model(raw_map.to(device=devices[0])).cpu().numpy()
             raw_map = raw_map.cpu().numpy()
-        tifffile.imwrite(f'{resultFolder}/processed_maps/{map_index}_denoised.tif', predicted_map, imagej=True, metadata={'axes': 'ZYX'}, compression=None)
-        tifffile.imwrite(f'{resultFolder}/combined_maps/{map_index}_combined.tif', np.concatenate((raw_map, predicted_map), axis=1), imagej=True, metadata={'axes': 'ZYX'}, compression=None)
+            tifffile.imwrite(f'{resultFolder}/processed_maps/{map_index}_denoised.tif', predicted_map, imagej=True, metadata={'axes': 'ZYX'}, compression=None)
+            tifffile.imwrite(f'{resultFolder}/combined_maps/{map_index}_combined.tif', np.concatenate((raw_map, predicted_map), axis=1), imagej=True, metadata={'axes': 'ZYX'}, compression=None)
 
 
-def save_checkpoint(model, optimizer, scheduler, cur_epoch, path):
-    if isinstance(model, torch.nn.parallel.DistributedDataParallel):
-        model_to_save = model.module
+def predict3d(model, rawdataFolder, paramsFolder, resultFolder):
+    devices = try_all_gpus()
+    def init_weights(m):
+        if type(m) == torch.nn.Linear or type(m) == torch.nn.Conv3d or type(m) == torch.nn.Conv2d:  
+            torch.nn.init.xavier_uniform_(m.weight)
+    current_epoch = len(get_all_files(paramsFolder))
+    print(f"current_epoch:{current_epoch}")
+    if current_epoch != 0:
+        state_dict = torch.load(f'{paramsFolder}/checkPoint_{current_epoch - 1}.pth')
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict)
+        if missing_keys:
+            print(f"missing_keys: {missing_keys}")
+        if unexpected_keys:
+            print(f"unused_keys: {unexpected_keys}")
+    
+        print(f'load {paramsFolder}/checkPoint_{current_epoch - 1}')
     else:
-        model_to_save = model
+        model.apply(init_weights)
+        print(f'no params found, randomly init model')
     
-    checkpoint = {
-        'model': model_to_save,           
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict(),
-        'cur_epoch': cur_epoch,
-    }
-    
-    torch.save(checkpoint, path)
-    print(f"Checkpoint saved to {path}")
+    model = model.to(devices[0])
+    map_files = get_all_files(rawdataFolder)
+    model.eval()
+    with torch.no_grad():
+        for map_index, map_file in enumerate(map_files): 
+            print(f"processing: {map_file}")
+            raw_map = np.asarray(tifffile.imread(map_file))
+            normalized_map = torch.from_numpy(normalize(raw_map, mode=mode))
+            predicted_map = model(raw_map.to(device=devices[0])).cpu().numpy()
+            raw_map = raw_map.cpu().numpy()
+            tifffile.imwrite(f'{resultFolder}/processed_maps/{map_index}_denoised.tif', predicted_map, imagej=True, metadata={'axes': 'ZYX'}, compression=None)
+            tifffile.imwrite(f'{resultFolder}/combined_maps/{map_index}_combined.tif', np.concatenate((raw_map, predicted_map), axis=1), imagej=True, metadata={'axes': 'ZYX'}, compression=None)
 
 

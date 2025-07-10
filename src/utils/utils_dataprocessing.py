@@ -123,7 +123,7 @@ def resample(batch_chunks, kernel, interpolate_mode='fourier'):
         conv_layer.weight.data = kernel
         batch_chunks = conv_layer(batch_chunks)
         if interpolate_mode == 'fourier':
-            batch_chunks = fourier_interpolate(batch_chunks)
+            batch_chunks = fourier_interpolate(batch_chunks) * 16
         else:
             batch_chunks = torch.nn.functional.interpolate(batch_chunks, scale_factor=2, mode='trilinear')
     elif len(spatial_dims) == 2:
@@ -131,7 +131,7 @@ def resample(batch_chunks, kernel, interpolate_mode='fourier'):
         conv_layer.weight.data = kernel
         batch_chunks = conv_layer(batch_chunks)
         if interpolate_mode == 'fourier':
-            batch_chunks = fourier_interpolate(batch_chunks)
+            batch_chunks = fourier_interpolate(batch_chunks) * 16
         else:
             batch_chunks = torch.nn.functional.interpolate(batch_chunks, scale_factor=2, mode='bilinear')
     return batch_chunks

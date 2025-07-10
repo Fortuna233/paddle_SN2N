@@ -4,7 +4,7 @@ from src.models.scunet import SCUNet
 
 mode = '2d'
 world_size = 1
-num_epochs = 10
+num_epochs = 20
 batch_size = 128
 lr = 1e-4
 vali_ratio = 0.1
@@ -19,7 +19,7 @@ datasetsFolder = '/home/tyche/paddle_SN2N/data/data_2d/datasets'
 paramsFolder = '/home/tyche/paddle_SN2N/data/data_2d/params'
 predictionsFolder = '/home/tyche/paddle_SN2N/data/data_2d/predictions'
 logsFolder = '/home/tyche/paddle_SN2N/data/data_2d/logs'
-resultFolder = '/home/tyche/paddle_SN2N/data/data_2d/results'
+visualizationFolder = '/home/tyche/paddle_SN2N/data/data_2d/process_visualization'
 
 # model = SCUNet(in_nc=1, config=[2, 2, 2, 2, 2, 2, 2],
 #            dim=32, drop_path_rate=0.1, input_resolution=48, head_dim=16, window_size=3)

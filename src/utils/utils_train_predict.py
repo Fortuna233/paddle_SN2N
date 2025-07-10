@@ -207,8 +207,9 @@ def predict2d(model, rawdataFolder, paramsFolder, resultFolder):
     with torch.no_grad():
         for map_index, map_file in enumerate(map_files): 
             print(f"processing: {map_file}")
-            raw_map = np.asarray(tifffile.imread(map_file))
-            normalized_map = torch.from_numpy(normalize(raw_map, mode=mode))
+            map_data = np.asarray(tifffile.imread(map_file))
+            map_data = torch.from_numpy(normalize(map_data, mode='2d'))
+            
             predicted_map = model(raw_map.to(device=devices[0])).cpu().numpy()
             raw_map = raw_map.cpu().numpy()
             tifffile.imwrite(f'{resultFolder}/processed_maps/{map_index}_denoised.tif', predicted_map, imagej=True, metadata={'axes': 'ZYX'}, compression=None)
@@ -242,7 +243,7 @@ def predict3d(model, rawdataFolder, paramsFolder, resultFolder):
         for map_index, map_file in enumerate(map_files): 
             print(f"processing: {map_file}")
             raw_map = np.asarray(tifffile.imread(map_file))
-            normalized_map = torch.from_numpy(normalize(raw_map, mode=mode))
+            normalized_map = torch.from_numpy(normalize(raw_map, mode='3d'))
             predicted_map = model(raw_map.to(device=devices[0])).cpu().numpy()
             raw_map = raw_map.cpu().numpy()
             tifffile.imwrite(f'{resultFolder}/processed_maps/{map_index}_denoised.tif', predicted_map, imagej=True, metadata={'axes': 'ZYX'}, compression=None)

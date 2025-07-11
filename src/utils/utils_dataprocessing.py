@@ -166,119 +166,89 @@ def fourier_interpolate(image: torch.Tensor, factor: int = 2) -> torch.Tensor:
         target_height = height * factor
         target_width = width * factor
     
-    # Initialize output tensor
+    # Symmetric padding
     if is_3d:
-        output_shape = (batch_size, channels, target_depth, target_height, target_width)
+        padding = (width//2, width//2, height//2, height//2, depth//2, depth//2)
     else:
-        output_shape = (batch_size, channels, target_height, target_width)
-        
-    upsampled_images = torch.zeros(output_shape, dtype=image.dtype, device=image.device)
+        padding = (width//2, width//2, height//2, height//2)
     
-    # Process each sample and channel
-    for b in range(batch_size):
-        for c in range(channels):
-            if is_3d:
-                img = image[b, c]  # [D, H, W]
-                # Symmetric padding
-                pad_d = depth // 2
-                pad_h = height // 2
-                pad_w = width // 2
-                img_padded = torch.nn.functional.pad(
-                    img.unsqueeze(0).unsqueeze(0),  # Add batch and channel dimensions
-                    (pad_w, pad_w, pad_h, pad_h, pad_d, pad_d), 
-                    mode='reflect'
-                ).squeeze(0).squeeze(0)  # Remove added dimensions
-                
-                # 3D Fourier transform
-                img_fft = torch.fft.fftn(img_padded, dim=(0, 1, 2))
-                
-                # Frequency domain zero-padding
-                fft_d, fft_h, fft_w = img_fft.shape
-                new_fft_d = fft_d * factor
-                new_fft_h = fft_h * factor
-                new_fft_w = fft_w * factor
-                
-                fft_padded = torch.zeros((new_fft_d, new_fft_h, new_fft_w), 
-                                        dtype=img_fft.dtype, device=img_fft.device)
-                
-                # Place original frequency components
-                d_half, h_half, w_half = fft_d // 2, fft_h // 2, fft_w // 2
-                
-                # Copy 8 quadrants (3D case)
-                fft_padded[:d_half, :h_half, :w_half] = img_fft[:d_half, :h_half, :w_half]
-                fft_padded[:d_half, :h_half, -w_half:] = img_fft[:d_half, :h_half, -w_half:]
-                fft_padded[:d_half, -h_half:, :w_half] = img_fft[:d_half, -h_half:, :w_half]
-                fft_padded[:d_half, -h_half:, -w_half:] = img_fft[:d_half, -h_half:, -w_half:]
-                fft_padded[-d_half:, :h_half, :w_half] = img_fft[-d_half:, :h_half, :w_half]
-                fft_padded[-d_half:, :h_half, -w_half:] = img_fft[-d_half:, :h_half, -w_half:]
-                fft_padded[-d_half:, -h_half:, :w_half] = img_fft[-d_half:, -h_half:, :w_half]
-                fft_padded[-d_half:, -h_half:, -w_half:] = img_fft[-d_half:, -h_half:, -w_half:]
-                
-                # Inverse 3D Fourier transform
-                img_ifft = torch.fft.ifftn(fft_padded, dim=(0, 1, 2))
-                
-                # Take real part and adjust scale
-                img_real = img_ifft.real
-                
-                # Crop to target size
-                start_d = (new_fft_d - target_depth) // 2
-                start_h = (new_fft_h - target_height) // 2
-                start_w = (new_fft_w - target_width) // 2
-                
-                img_cropped = img_real[
-                    start_d:start_d+target_depth,
-                    start_h:start_h+target_height,
-                    start_w:start_w+target_width
-                ]
-                
-                upsampled_images[b, c] = img_cropped / factor**3  # 3D normalization
-            else:
-                # 2D processing logic (similar to original code but handles channels)
-                img = image[b, c]  # [H, W]
-                
-                # Symmetric padding
-                pad_h = height // 2
-                pad_w = width // 2
-                img_padded = torch.nn.functional.pad(
-                    img.unsqueeze(0).unsqueeze(0),  # Add batch and channel dimensions
-                    (pad_w, pad_w, pad_h, pad_h), 
-                    mode='reflect'
-                ).squeeze(0).squeeze(0)  # Remove added dimensions
-                
-                # 2D Fourier transform
-                img_fft = torch.fft.fft2(img_padded)
-                
-                # Frequency domain zero-padding
-                fft_h, fft_w = img_fft.shape
-                new_fft_h = fft_h * factor
-                new_fft_w = fft_w * factor
-                
-                fft_padded = torch.zeros((new_fft_h, new_fft_w), 
-                                        dtype=img_fft.dtype, device=img_fft.device)
-                
-                # Place original frequency components
-                h_half, w_half = fft_h // 2, fft_w // 2
-                
-                fft_padded[:h_half, :w_half] = img_fft[:h_half, :w_half]
-                fft_padded[:h_half, -w_half:] = img_fft[:h_half, -w_half:]
-                fft_padded[-h_half:, :w_half] = img_fft[-h_half:, :w_half]
-                fft_padded[-h_half:, -w_half:] = img_fft[-h_half:, -w_half:]
-                
-                # Inverse 2D Fourier transform
-                img_ifft = torch.fft.ifft2(fft_padded)
-                
-                # Take real part and adjust scale
-                img_real = img_ifft.real
-                
-                # Crop to target size
-                start_h = (new_fft_h - target_height) // 2
-                start_w = (new_fft_w - target_width) // 2
-                
-                img_cropped = img_real[
-                    start_h:start_h+target_height,
-                    start_w:start_w+target_width
-                ]
-                
-                upsampled_images[b, c] = img_cropped / factor**2  # 2D normalization
+    img_padded = torch.nn.functional.pad(image, padding, mode='reflect')
+    
+    # Perform Fourier transform
+    if is_3d:
+        img_fft = torch.fft.fftn(img_padded, dim=(-3, -2, -1))
+    else:
+        img_fft = torch.fft.fft2(img_padded, dim=(-2, -1))
+    
+    # Get original and target frequency domain shapes
+    fft_shape = list(img_fft.shape[-3:]) if is_3d else list(img_fft.shape[-2:])
+    new_fft_shape = [s * factor for s in fft_shape]
+    
+    # Create padded frequency domain tensor
+    fft_padded_shape = list(img_fft.shape[:-len(fft_shape)]) + new_fft_shape
+    fft_padded = torch.zeros(fft_padded_shape, dtype=img_fft.dtype, device=img_fft.device)
+    
+    # Calculate center indices
+    if is_3d:
+        d_half, h_half, w_half = fft_shape[0]//2, fft_shape[1]//2, fft_shape[2]//2
+        new_d_half, new_h_half, new_w_half = new_fft_shape[0]//2, new_fft_shape[1]//2, new_fft_shape[2]//2
+        
+        # Place original frequency components in new frequency space
+        # Quadrant 1: top-left-front
+        fft_padded[..., :d_half, :h_half, :w_half] = img_fft[..., :d_half, :h_half, :w_half]
+        # Quadrant 2: top-right-front
+        fft_padded[..., :d_half, :h_half, -w_half:] = img_fft[..., :d_half, :h_half, -w_half:]
+        # Quadrant 3: bottom-left-front
+        fft_padded[..., :d_half, -h_half:, :w_half] = img_fft[..., :d_half, -h_half:, :w_half]
+        # Quadrant 4: bottom-right-front
+        fft_padded[..., :d_half, -h_half:, -w_half:] = img_fft[..., :d_half, -h_half:, -w_half:]
+        # Quadrant 5: top-left-back
+        fft_padded[..., -d_half:, :h_half, :w_half] = img_fft[..., -d_half:, :h_half, :w_half]
+        # Quadrant 6: top-right-back
+        fft_padded[..., -d_half:, :h_half, -w_half:] = img_fft[..., -d_half:, :h_half, -w_half:]
+        # Quadrant 7: bottom-left-back
+        fft_padded[..., -d_half:, -h_half:, :w_half] = img_fft[..., -d_half:, -h_half:, :w_half]
+        # Quadrant 8: bottom-right-back
+        fft_padded[..., -d_half:, -h_half:, -w_half:] = img_fft[..., -d_half:, -h_half:, -w_half:]
+    else:
+        h_half, w_half = fft_shape[0]//2, fft_shape[1]//2
+        new_h_half, new_w_half = new_fft_shape[0]//2, new_fft_shape[1]//2
+        
+        # Place original frequency components in new frequency space
+        # Quadrant 1: top-left
+        fft_padded[..., :h_half, :w_half] = img_fft[..., :h_half, :w_half]
+        # Quadrant 2: top-right
+        fft_padded[..., :h_half, -w_half:] = img_fft[..., :h_half, -w_half:]
+        # Quadrant 3: bottom-left
+        fft_padded[..., -h_half:, :w_half] = img_fft[..., -h_half:, :w_half]
+        # Quadrant 4: bottom-right
+        fft_padded[..., -h_half:, -w_half:] = img_fft[..., -h_half:, -w_half:]
+    
+    # Perform inverse Fourier transform
+    if is_3d:
+        img_ifft = torch.fft.ifftn(fft_padded, dim=(-3, -2, -1))
+    else:
+        img_ifft = torch.fft.ifft2(fft_padded, dim=(-2, -1))
+    
+    # Take real part
+    img_real = img_ifft.real
+    
+    # Calculate crop indices
+    if is_3d:
+        start_d = (new_fft_shape[0] - target_depth) // 2
+        start_h = (new_fft_shape[1] - target_height) // 2
+        start_w = (new_fft_shape[2] - target_width) // 2
+        upsampled_images = img_real[..., start_d:start_d+target_depth, 
+                                   start_h:start_h+target_height, 
+                                   start_w:start_w+target_width]
+        # Normalization factor for 3D
+        upsampled_images = upsampled_images / (factor ** 3)
+    else:
+        start_h = (new_fft_shape[0] - target_height) // 2
+        start_w = (new_fft_shape[1] - target_width) // 2
+        upsampled_images = img_real[..., start_h:start_h+target_height, 
+                                   start_w:start_w+target_width]
+        # Normalization factor for 2D
+        upsampled_images = upsampled_images / (factor ** 2)
     
     return upsampled_images

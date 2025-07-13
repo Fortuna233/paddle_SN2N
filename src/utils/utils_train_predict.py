@@ -1,12 +1,11 @@
 import os
 import time
+from matplotlib.pyplot import box
 import tifffile
 from datetime import datetime
-
+from itertools import product
 import numpy as np
 from sklearn.model_selection import train_test_split
-
-
 
 import torch
 import torch.utils
@@ -24,7 +23,7 @@ def try_all_gpus():
     return devices if devices else [torch.device('cpu')]
 
 
-def init_model(model, paramsFolder):
+def load_model(model, paramsFolder):
     def init_weights(m):
         if type(m) == torch.nn.Linear or type(m) == torch.nn.Conv3d or type(m) == torch.nn.Conv2d:  
             torch.nn.init.xavier_uniform_(m.weight)
@@ -43,6 +42,7 @@ def init_model(model, paramsFolder):
         model.apply(init_weights)
         print(f'no params found, randomly init model')
     return model
+
 
 class myDataset(Dataset):
     def __init__(self, file_list, is_train):
@@ -91,7 +91,7 @@ def train(rank, world_size, model, kernel, paramsFolder, datasetsFolder, logsFol
     if rank == 0:
         total_params = sum(p.numel() for p in model.parameters())
         print(f"num_parameters: {total_params}")
-    model = init_model(model=model, paramsFolder=paramsFolder)
+    model = load_model(model=model, paramsFolder=paramsFolder)
     model = create_ddp_model(rank=rank, model=model)  
     current_epoch = len(get_all_files(paramsFolder))
     
@@ -108,8 +108,6 @@ def train(rank, world_size, model, kernel, paramsFolder, datasetsFolder, logsFol
 
     train_Loss = []
     vali_Loss = []
-
-
     starttime = time.time()
     local_now = datetime.now()
     if rank==0:
@@ -180,29 +178,57 @@ def train(rank, world_size, model, kernel, paramsFolder, datasetsFolder, logsFol
     cleanup()
 
 
-# # input raw_map and output prediction file
-def predict2d(model, rawdataFolder, paramsFolder, resultFolder):
-    # 加载模型
+# input raw_map and output prediction file
+def predict2d(model, box_size, stride, batch_size, rawdataFolder, paramsFolder, resultFolder):
+    # load model
     devices = try_all_gpus()
-    model = init_model(model=model, paramsFolder=paramsFolder)
+    model = load_model(model=model, paramsFolder=paramsFolder)
     model = model.to(devices[0])
+    # generate weght matrix
+    block_weight = np.ones([2 * stride - box_size, 2 * stride - box_size], dtype=np.float32)
+    block_weight = np.pad(block_weight, [stride - box_size + 1, stride - box_size + 1], 'linear_ramp')
+    block_weight = torch.from_numpy(block_weight[(slice(1, -1),) * 2]).to(devices[0])
+    print(block_weight.shape)
     map_files = get_all_files(rawdataFolder)
     model.eval()
     with torch.no_grad():
         for map_index, map_file in enumerate(map_files): 
-            print(f"processing: {map_file}")
-            map_data = np.asarray(tifffile.imread(map_file))
-            map_data = torch.from_numpy(normalize(map_data, mode='2d'))
-            predicted_map = model(raw_map.to(device=devices[0])).cpu().numpy()
-            raw_map = raw_map.cpu().numpy()
-            tifffile.imwrite(f'{resultFolder}/processed_maps/{map_index}_denoised.tif', predicted_map, imagej=True, metadata={'axes': 'ZYX'}, compression=None)
-            tifffile.imwrite(f'{resultFolder}/combined_maps/{map_index}_combined.tif', np.concatenate((raw_map, predicted_map), axis=1), imagej=True, metadata={'axes': 'ZYX'}, compression=None)
+            print(f"processing: {map_file} {map_index}/{len(map_files)}")
+            # pad map
+            map_data = torch.tensor((tifffile.imread(map_file)))
+            map_data = normalize(map_data, mode='2d')
+            map_shape = map_data.shape
+            print(f"map_shape: {map_shape}")
+            if len(map_shape) == 2:
+                map_data = map_data.reshape(-1, *map_shape)
+            map_data = torch.nn.functional.pad(map_data, (0, 0, box_size, box_size, box_size, box_size), mode='constant', value=0.0)
+
+            # init result and accumulator matrix
+            result = torch.zeros_like(map_data, dtype=torch.float32)
+            weight_accumulator = torch.zeros_like(map_data, dtype=torch.float32)
+
+            # generate batch_chunks and mapping
+            z_coords = torch.arange(0, map_data.shape[0], 1)
+            x_coords = torch.arange(stride, map_data.shape[1] - box_size, stride)
+            y_coords = torch.arange(stride, map_data.shape[2] - box_size, stride)
+            chunk_coords = list(product(z_coords, x_coords, y_coords))
+            for i in range(0, len(chunk_coords), batch_size):
+                batch_coords = chunk_coords[i: min(i + batch_size, len(chunk_coords))]
+                batch_z, batch_x, batch_y = zip(*batch_coords)
+                batch_z = torch.tensor(batch_z, device=map_data.device)
+                batch_x = torch.tensor(batch_x, device=map_data.device)
+                batch_y = torch.tensor(batch_y, device=map_data.device)
+                batch_z = batch_z[:, None, None].expand(-1, box_size, box_size)
+                batch_x = batch_x[:, None, None].expand(-1, -1, box_size)
+                batch_y = batch_y[:, None, None].expand(-1, box_size, -1)
+                batch_tensor = model(map_data[batch_z, batch_x, batch_y].reshape(batch_size, -1, box_size, box_size).to(devices[0]))
+                batch_tensor = torch.matmul(batch_tensor, block_weight).reshape(batch_size, box_size, box_size)
+            # save result
 
 
 def predict3d(model, rawdataFolder, paramsFolder, resultFolder):
     devices = try_all_gpus()
-    model = init_model(model=model, paramsFolder=paramsFolder)
-    
+    model = load_model(model=model, paramsFolder=paramsFolder)
     model = model.to(devices[0])
     map_files = get_all_files(rawdataFolder)
     model.eval()

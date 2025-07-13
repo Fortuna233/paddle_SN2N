@@ -9,7 +9,7 @@ from sklearn.model_selection import train_test_split
 
 import torch
 import torch.utils
-from torch import nn
+from torch import nn, tensor
 from torch.amp import GradScaler, autocast
 from torch.utils.data import Dataset, DataLoader
 from torch.optim.lr_scheduler import OneCycleLR
@@ -186,23 +186,21 @@ def predict2d(model, box_size, stride, batch_size, rawdataFolder, paramsFolder, 
     model = model.to(devices[0])
     # generate weght matrix
     block_weight = np.ones([2 * stride - box_size, 2 * stride - box_size], dtype=np.float32)
-    block_weight = np.pad(block_weight, [stride - box_size + 1, stride - box_size + 1], 'linear_ramp')
+    block_weight = np.pad(block_weight, [box_size - stride + 1, box_size - stride + 1], 'linear_ramp')
     block_weight = torch.from_numpy(block_weight[(slice(1, -1),) * 2]).to(devices[0])
-    print(block_weight.shape)
+
     map_files = get_all_files(rawdataFolder)
     model.eval()
     with torch.no_grad():
         for map_index, map_file in enumerate(map_files): 
-            print(f"processing: {map_file} {map_index}/{len(map_files)}")
+            print(f"processing: {map_index}/{len(map_files)} {map_file}")
             # pad map
-            map_data = torch.tensor((tifffile.imread(map_file)))
+            map_data = tifffile.imread(map_file)
             map_data = normalize(map_data, mode='2d')
             map_shape = map_data.shape
-            print(f"map_shape: {map_shape}")
             if len(map_shape) == 2:
                 map_data = map_data.reshape(-1, *map_shape)
-            map_data = torch.nn.functional.pad(map_data, (0, 0, box_size, box_size, box_size, box_size), mode='constant', value=0.0)
-
+            map_data = torch.nn.functional.pad(torch.from_numpy(map_data), (box_size, box_size, box_size, box_size, 0, 0), mode='constant', value=0.0)
             # init result and accumulator matrix
             result = torch.zeros_like(map_data, dtype=torch.float32)
             weight_accumulator = torch.zeros_like(map_data, dtype=torch.float32)
@@ -218,12 +216,25 @@ def predict2d(model, box_size, stride, batch_size, rawdataFolder, paramsFolder, 
                 batch_z = torch.tensor(batch_z, device=map_data.device)
                 batch_x = torch.tensor(batch_x, device=map_data.device)
                 batch_y = torch.tensor(batch_y, device=map_data.device)
-                batch_z = batch_z[:, None, None].expand(-1, box_size, box_size)
-                batch_x = batch_x[:, None, None].expand(-1, -1, box_size)
-                batch_y = batch_y[:, None, None].expand(-1, box_size, -1)
-                batch_tensor = model(map_data[batch_z, batch_x, batch_y].reshape(batch_size, -1, box_size, box_size).to(devices[0]))
-                batch_tensor = torch.matmul(batch_tensor, block_weight).reshape(batch_size, box_size, box_size)
+
+                batch_chunks = map_data[
+                batch_z[:, None, None],
+                batch_x[:, None, None] + torch.arange(box_size, device=map_data.device)[None, :, None],
+                batch_y[:, None, None] + torch.arange(box_size, device=map_data.device)[None, None, :]]
+                print(torch.mean(batch_chunks))
+                batch_chunks = model(batch_chunks.reshape(-1, 1, box_size, box_size).to(devices[0]))
+                print(torch.mean(batch_chunks))
+                batch_chunks *= block_weight.unsqueeze(0)
+                batch_chunks = batch_chunks.reshape(-1, box_size, box_size).cpu()
+                print(torch.mean(batch_chunks))
+                result, weight_accumulator = process_batch(result=result, weight_accumulator=weight_accumulator, batch_coords=batch_coords, batch_pred=batch_chunks, block_weight=block_weight, box_size=box_size)
+
             # save result
+            result = result[:, box_size:-box_size, box_size:-box_size]
+            result = result / weight_accumulator[:, box_size:-box_size, box_size:-box_size].clamp(min=1e-8)
+            output_path = os.path.join(f"{resultFolder}/processed_maps", os.path.basename(map_file).replace('.tif', '_pred.tif'))
+            tifffile.imwrite(output_path, result.cpu().numpy().astype(np.float32))
+            print(f"Saved prediction to: {output_path}")
 
 
 def predict3d(model, rawdataFolder, paramsFolder, resultFolder):
@@ -243,3 +254,34 @@ def predict3d(model, rawdataFolder, paramsFolder, resultFolder):
             tifffile.imwrite(f'{resultFolder}/combined_maps/{map_index}_combined.tif', np.concatenate((raw_map, predicted_map), axis=1), imagej=True, metadata={'axes': 'ZYX'}, compression=None)
 
 
+def process_batch(result, weight_accumulator, batch_coords, batch_pred, block_weight, box_size):
+    # 提取批量坐标
+    batch_coords = torch.as_tensor(batch_coords)
+    z_coords = batch_coords[:, 0]
+    x_coords = batch_coords[:, 1]
+    y_coords = batch_coords[:, 2]
+    
+    # 创建三维网格索引
+    batch_size = batch_coords.shape[0]
+    x_indices = torch.arange(box_size, device=result.device).reshape(1, box_size, 1).expand(batch_size, box_size, box_size)
+    y_indices = torch.arange(box_size, device=result.device).reshape(1, 1, box_size).expand(batch_size, box_size, box_size)
+    
+    # 计算每个块在结果张量中的绝对索引
+    x_abs_indices = x_coords.reshape(-1, 1, 1) + x_indices
+    y_abs_indices = y_coords.reshape(-1, 1, 1) + y_indices
+    z_abs_indices = z_coords.reshape(-1, 1, 1).expand(batch_size, box_size, box_size)
+    
+    # 展平索引和预测值以便进行批量操作
+    flat_z = z_abs_indices.flatten()
+    flat_x = x_abs_indices.flatten()
+    flat_y = y_abs_indices.flatten()
+    flat_pred = batch_pred.view(batch_size, -1).flatten()
+    
+    # 使用原子操作执行批量累加
+    result.index_put_((flat_z, flat_x, flat_y), flat_pred, accumulate=True)
+    
+    # 同样处理权重累加器
+    flat_weight = block_weight.unsqueeze(0).expand(batch_size, box_size, box_size).flatten().cpu()
+    weight_accumulator.index_put_((flat_z, flat_x, flat_y), flat_weight, accumulate=True)
+    
+    return result, weight_accumulator
